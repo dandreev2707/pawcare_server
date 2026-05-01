@@ -93,6 +93,14 @@ class Reminder(Base):
     is_done    = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+class TelegramUser(Base):
+    __tablename__ = "telegram_users"
+    id         = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id    = Column(String, ForeignKey("users.id"), nullable=False, unique=True)
+    chat_id    = Column(String, nullable=False)
+    username   = Column(String)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 # Создаём все таблицы
 Base.metadata.create_all(bind=engine)
 
@@ -460,3 +468,148 @@ async def get_vets(lat: float, lon: float, current_user: User = Depends(get_curr
             return clinics
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Ошибка поиска: {str(e)}")
+
+# ── TELEGRAM BOT ────────────────────────────────────────
+TELEGRAM_BOT_TOKEN = "ВАШ_ТОКЕН_ЗДЕСЬ"
+
+class TelegramLinkRequest(BaseModel):
+    chat_id: str
+    username: Optional[str] = None
+    link_code: str
+
+# Хранилище кодов привязки (в памяти)
+link_codes: dict = {}
+
+@app.post("/api/v1/telegram/generate-code")
+def generate_link_code(current_user: User = Depends(get_current_user)):
+    import random
+    import string
+    code = ''.join(random.choices(string.digits, k=6))
+    link_codes[code] = current_user.id
+    return {"code": code}
+
+@app.post("/api/v1/telegram/link")
+def link_telegram(
+    request: TelegramLinkRequest,
+    db: Session = Depends(get_db)
+):
+    user_id = link_codes.get(request.link_code)
+    if not user_id:
+        raise HTTPException(status_code=400, detail="Неверный код или код устарел")
+
+    existing = db.query(TelegramUser).filter(
+        TelegramUser.user_id == user_id
+    ).first()
+    if existing:
+        existing.chat_id = request.chat_id
+        existing.username = request.username
+    else:
+        tg_user = TelegramUser(
+            user_id=user_id,
+            chat_id=request.chat_id,
+            username=request.username,
+        )
+        db.add(tg_user)
+    db.commit()
+    del link_codes[request.link_code]
+    return {"message": "Аккаунт успешно привязан!"}
+
+@app.delete("/api/v1/telegram/unlink")
+def unlink_telegram(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    tg = db.query(TelegramUser).filter(
+        TelegramUser.user_id == current_user.id
+    ).first()
+    if tg:
+        db.delete(tg)
+        db.commit()
+    return {"message": "Telegram отвязан"}
+
+@app.get("/api/v1/telegram/status")
+def telegram_status(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    tg = db.query(TelegramUser).filter(
+        TelegramUser.user_id == current_user.id
+    ).first()
+    return {
+        "linked": tg is not None,
+        "username": tg.username if tg else None,
+    }
+
+@app.get("/api/v1/telegram/pets")
+def telegram_get_pets(chat_id: str, db: Session = Depends(get_db)):
+    tg = db.query(TelegramUser).filter(
+        TelegramUser.chat_id == chat_id
+    ).first()
+    if not tg:
+        raise HTTPException(status_code=404, detail="Аккаунт не привязан")
+    pets = db.query(Pet).filter(
+        Pet.owner_id == tg.user_id,
+        Pet.is_deleted == False
+    ).all()
+    return [{"id": p.id, "name": p.name, "breed": p.breed, "sex": p.sex} for p in pets]
+
+@app.get("/api/v1/telegram/reminders")
+def telegram_get_reminders(chat_id: str, db: Session = Depends(get_db)):
+    tg = db.query(TelegramUser).filter(
+        TelegramUser.chat_id == chat_id
+    ).first()
+    if not tg:
+        raise HTTPException(status_code=404, detail="Аккаунт не привязан")
+
+    today = date.today()
+    yesterday = today - timedelta(days=1)
+    pets = db.query(Pet).filter(
+        Pet.owner_id == tg.user_id,
+        Pet.is_deleted == False
+    ).all()
+
+    reminders = []
+    for pet in pets:
+        records = db.query(HealthRecord).filter(
+            HealthRecord.pet_id == pet.id,
+            HealthRecord.next_date != None
+        ).all()
+        for r in records:
+            try:
+                record_date = date.fromisoformat(r.next_date)
+            except Exception:
+                continue
+            if record_date < yesterday:
+                continue
+            reminders.append({
+                "pet_name": pet.name,
+                "record_type": r.record_type,
+                "title": r.title,
+                "remind_at": r.next_date,
+            })
+
+    custom = db.query(Reminder).filter(
+        Reminder.user_id == tg.user_id
+    ).all()
+    for r in custom:
+        pet = db.query(Pet).filter(Pet.id == r.pet_id).first()
+        reminders.append({
+            "pet_name": pet.name if pet else "Питомец",
+            "record_type": "custom",
+            "title": r.title,
+            "remind_at": r.remind_at,
+        })
+
+    reminders.sort(key=lambda x: x["remind_at"] or "")
+    return reminders
+
+@app.delete("/api/v1/telegram/unlink-by-chat")
+def unlink_by_chat(chat_id: str, db: Session = Depends(get_db)):
+    tg = db.query(TelegramUser).filter(
+        TelegramUser.chat_id == chat_id
+    ).first()
+    if not tg:
+        raise HTTPException(status_code=404, detail="Аккаунт не привязан")
+    db.delete(tg)
+    db.commit()
+    return {"message": "Отвязано"}
