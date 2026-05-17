@@ -217,3 +217,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Загруженные файлы пользователей
+uploads/
+
+# Шрифты (скачиваются автоматически)
+DejaVuSans.ttf
+DejaVuSans-Bold.ttf

@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Depends, HTTPException, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy import create_engine, Column, String, Boolean, DateTime, Float, Text, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
@@ -9,21 +9,42 @@ from pydantic import BaseModel
 from typing import List, Optional
 from passlib.context import CryptContext
 from jose import jwt, JWTError
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
+from dotenv import load_dotenv
 import uuid
 import os
+import random
+import string
 import shutil
 import httpx
+import io
+from fpdf import FPDF
+import cloudinary
+import cloudinary.uploader
+
+load_dotenv()
 
 # ── Настройки ──────────────────────────────────────────
-DATABASE_URL        = "postgresql://postgres:pawcare123@localhost:5432/pawcare_db"
-SECRET_KEY          = "pawcare-secret-key-2024"
+DATABASE_URL        = os.getenv("DATABASE_URL")
+SECRET_KEY          = os.getenv("SECRET_KEY")
 ALGORITHM           = "HS256"
 TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
 UPLOAD_DIR          = "uploads"
-YANDEX_API_KEY      = "1ca7aeee-1cc2-43ca-96f7-81a6efa139d3"
+YANDEX_API_KEY      = os.getenv("YANDEX_API_KEY", "")
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+CLOUDINARY_CLOUD_NAME  = os.getenv("CLOUDINARY_CLOUD_NAME", "")
+CLOUDINARY_API_KEY_VAL = os.getenv("CLOUDINARY_API_KEY", "")
+CLOUDINARY_API_SECRET  = os.getenv("CLOUDINARY_API_SECRET", "")
+
+if CLOUDINARY_CLOUD_NAME:
+    cloudinary.config(
+        cloud_name=CLOUDINARY_CLOUD_NAME,
+        api_key=CLOUDINARY_API_KEY_VAL,
+        api_secret=CLOUDINARY_API_SECRET,
+        secure=True,
+    )
 
 # ── База данных ─────────────────────────────────────────
 engine       = create_engine(DATABASE_URL)
@@ -45,7 +66,7 @@ class User(Base):
     name          = Column(String, nullable=False)
     password_hash = Column(String, nullable=False)
     is_active     = Column(Boolean, default=True)
-    created_at    = Column(DateTime, default=datetime.utcnow)
+    created_at    = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     pets          = relationship("Pet", back_populates="owner")
 
 class Pet(Base):
@@ -58,7 +79,7 @@ class Pet(Base):
     sex        = Column(String)
     photo_url  = Column(String)
     is_deleted = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     owner          = relationship("User", back_populates="pets")
     health_records = relationship("HealthRecord", back_populates="pet")
     weight_logs    = relationship("WeightLog", back_populates="pet")
@@ -72,7 +93,7 @@ class HealthRecord(Base):
     description = Column(Text)
     record_date = Column(String, nullable=False)
     next_date   = Column(String)
-    created_at  = Column(DateTime, default=datetime.utcnow)
+    created_at  = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     pet         = relationship("Pet", back_populates="health_records")
 
 class WeightLog(Base):
@@ -80,18 +101,19 @@ class WeightLog(Base):
     id          = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     pet_id      = Column(String, ForeignKey("pets.id"), nullable=False)
     weight_kg   = Column(Float, nullable=False)
-    measured_at = Column(DateTime, default=datetime.utcnow)
+    measured_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     pet         = relationship("Pet", back_populates="weight_logs")
 
 class Reminder(Base):
     __tablename__ = "reminders"
-    id         = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    pet_id     = Column(String, ForeignKey("pets.id"), nullable=False)
-    user_id    = Column(String, ForeignKey("users.id"), nullable=False)
-    title      = Column(String, nullable=False)
-    remind_at  = Column(String, nullable=False)
-    is_done    = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    id          = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    pet_id      = Column(String, ForeignKey("pets.id"), nullable=False)
+    user_id     = Column(String, ForeignKey("users.id"), nullable=False)
+    title       = Column(String, nullable=False)
+    remind_at   = Column(String, nullable=False)
+    is_done     = Column(Boolean, default=False)
+    repeat_rule = Column(String)  # None | 'weekly' | 'monthly' | 'yearly'
+    created_at  = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 class TelegramUser(Base):
     __tablename__ = "telegram_users"
@@ -99,7 +121,7 @@ class TelegramUser(Base):
     user_id    = Column(String, ForeignKey("users.id"), nullable=False, unique=True)
     chat_id    = Column(String, nullable=False)
     username   = Column(String)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 # Создаём все таблицы
 Base.metadata.create_all(bind=engine)
@@ -120,7 +142,7 @@ security    = HTTPBearer()
 
 # ── Вспомогательные функции ─────────────────────────────
 def create_token(user_id: str) -> str:
-    expire = datetime.utcnow() + timedelta(minutes=TOKEN_EXPIRE_MINUTES)
+    expire = datetime.now(timezone.utc) + timedelta(minutes=TOKEN_EXPIRE_MINUTES)
     return jwt.encode({"sub": user_id, "exp": expire}, SECRET_KEY, algorithm=ALGORITHM)
 
 def get_current_user(
@@ -160,6 +182,12 @@ class PetCreate(BaseModel):
     birth_date: Optional[str] = None
     sex:        Optional[str] = None
 
+class PetUpdate(BaseModel):
+    name:       Optional[str] = None
+    breed:      Optional[str] = None
+    birth_date: Optional[str] = None
+    sex:        Optional[str] = None
+
 class PetResponse(BaseModel):
     id: str
     name: str
@@ -192,9 +220,10 @@ class WeightResponse(BaseModel):
     measured_at: str
 
 class ReminderCreate(BaseModel):
-    pet_id:    str
-    title:     str
-    remind_at: str
+    pet_id:      str
+    title:       str
+    remind_at:   str
+    repeat_rule: Optional[str] = None
 
 # ── Эндпоинты ───────────────────────────────────────────
 
@@ -216,7 +245,9 @@ def register(request: RegisterRequest, db: Session = Depends(get_db)):
         name=request.name,
         password_hash=pwd_context.hash(request.password),
     )
-    db.add(user); db.commit(); db.refresh(user)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
     return TokenResponse(
         access_token=create_token(user.id),
         token_type="bearer",
@@ -251,7 +282,28 @@ def get_pets(current_user: User = Depends(get_current_user), db: Session = Depen
 def create_pet(data: PetCreate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     pet = Pet(owner_id=current_user.id, name=data.name, breed=data.breed,
               birth_date=data.birth_date, sex=data.sex)
-    db.add(pet); db.commit(); db.refresh(pet)
+    db.add(pet)
+    db.commit()
+    db.refresh(pet)
+    return PetResponse(id=pet.id, name=pet.name, breed=pet.breed,
+                       birth_date=pet.birth_date, sex=pet.sex, photo_url=pet.photo_url)
+
+@app.put("/api/v1/pets/{pet_id}", response_model=PetResponse)
+def update_pet(pet_id: str, data: PetUpdate,
+               current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    pet = db.query(Pet).filter(Pet.id == pet_id, Pet.owner_id == current_user.id).first()
+    if not pet:
+        raise HTTPException(status_code=404, detail="Питомец не найден")
+    if data.name is not None:
+        pet.name = data.name
+    if data.breed is not None:
+        pet.breed = data.breed
+    if data.birth_date is not None:
+        pet.birth_date = data.birth_date
+    if data.sex is not None:
+        pet.sex = data.sex
+    db.commit()
+    db.refresh(pet)
     return PetResponse(id=pet.id, name=pet.name, breed=pet.breed,
                        birth_date=pet.birth_date, sex=pet.sex, photo_url=pet.photo_url)
 
@@ -260,7 +312,19 @@ def delete_pet(pet_id: str, current_user: User = Depends(get_current_user), db: 
     pet = db.query(Pet).filter(Pet.id == pet_id, Pet.owner_id == current_user.id).first()
     if not pet:
         raise HTTPException(status_code=404, detail="Питомец не найден")
-    pet.is_deleted = True
+
+    # Удаляем все связанные данные
+    db.query(HealthRecord).filter(HealthRecord.pet_id == pet_id).delete()
+    db.query(WeightLog).filter(WeightLog.pet_id == pet_id).delete()
+    db.query(Reminder).filter(Reminder.pet_id == pet_id).delete()
+
+    # Удаляем фото с диска если есть
+    if pet.photo_url and pet.photo_url.startswith("/uploads/"):
+        filepath = os.path.join(UPLOAD_DIR, os.path.basename(pet.photo_url))
+        if os.path.exists(filepath):
+            os.remove(filepath)
+
+    db.delete(pet)
     db.commit()
     return {"message": "Питомец удалён"}
 
@@ -274,12 +338,28 @@ async def upload_pet_photo(
     pet = db.query(Pet).filter(Pet.id == pet_id, Pet.owner_id == current_user.id).first()
     if not pet:
         raise HTTPException(status_code=404, detail="Питомец не найден")
+    contents = await file.read()
+
+    # Всегда сохраняем локально (для работы в локальной сети)
     ext      = file.filename.split(".")[-1] if "." in file.filename else "jpg"
     filename = f"{pet_id}.{ext}"
     filepath = os.path.join(UPLOAD_DIR, filename)
     with open(filepath, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+        f.write(contents)
     pet.photo_url = f"/uploads/{filename}"
+
+    # Дополнительно загружаем в Cloudinary как резерв (не блокирует ответ)
+    if CLOUDINARY_CLOUD_NAME:
+        try:
+            cloudinary.uploader.upload(
+                contents,
+                public_id=f"pawcare/pets/{pet_id}",
+                overwrite=True,
+                resource_type="image",
+            )
+        except Exception:
+            pass
+
     db.commit()
     return {"photo_url": pet.photo_url}
 
@@ -314,7 +394,9 @@ def add_health(pet_id: str, data: HealthRecordCreate,
         pet_id=pet_id, record_type=data.record_type, title=data.title,
         description=data.description, record_date=data.record_date, next_date=data.next_date
     )
-    db.add(record); db.commit(); db.refresh(record)
+    db.add(record)
+    db.commit()
+    db.refresh(record)
     return HealthRecordResponse(
         id=record.id, record_type=record.record_type, title=record.title,
         description=record.description, record_date=record.record_date, next_date=record.next_date
@@ -331,8 +413,102 @@ def delete_health_record(pet_id: str, record_id: str,
     ).first()
     if not record:
         raise HTTPException(status_code=404, detail="Запись не найдена")
-    db.delete(record); db.commit()
+    db.delete(record)
+    db.commit()
     return {"message": "Запись удалена"}
+
+@app.get("/api/v1/pets/{pet_id}/health/export")
+def export_health_pdf(pet_id: str,
+                      current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    pet = db.query(Pet).filter(Pet.id == pet_id, Pet.owner_id == current_user.id).first()
+    if not pet:
+        raise HTTPException(status_code=404, detail="Питомец не найден")
+
+    records = db.query(HealthRecord).filter(
+        HealthRecord.pet_id == pet_id
+    ).order_by(HealthRecord.record_date.desc()).all()
+
+    type_labels = {
+        "vaccination":   "Прививка",
+        "deworming":     "Дегельминтизация",
+        "antiparasitic": "Обработка от паразитов",
+        "vet_visit":     "Визит к врачу",
+        "chronic":       "Хроническое заболевание",
+        "medication":    "Медикамент",
+    }
+
+    pdf = FPDF()
+    pdf.add_page()
+
+    font_path = os.path.join(os.path.dirname(__file__), "DejaVuSans.ttf")
+    bold_path = os.path.join(os.path.dirname(__file__), "DejaVuSans-Bold.ttf")
+    if os.path.exists(font_path):
+        pdf.add_font("DejaVu", "", font_path, uni=True)
+        pdf.add_font("DejaVu", "B", bold_path if os.path.exists(bold_path) else font_path, uni=True)
+        base_font = "DejaVu"
+    else:
+        base_font = "Helvetica"
+
+    # Заголовок
+    pdf.set_font(base_font, "B", 18)
+    pdf.cell(0, 12, f"Медицинская карта: {pet.name}", ln=True, align="C")
+    pdf.set_font(base_font, "", 11)
+    pdf.set_text_color(100, 100, 100)
+    info_parts = []
+    if pet.breed:
+        info_parts.append(pet.breed)
+    if pet.birth_date:
+        info_parts.append(f"Дата рождения: {pet.birth_date}")
+    if pet.sex:
+        info_parts.append("Мальчик" if pet.sex == "male" else "Девочка")
+    if info_parts:
+        pdf.cell(0, 7, "  |  ".join(info_parts), ln=True, align="C")
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(4)
+
+    # Линия
+    pdf.set_draw_color(44, 110, 73)
+    pdf.set_line_width(0.8)
+    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.ln(6)
+
+    if not records:
+        pdf.set_font(base_font, "", 12)
+        pdf.cell(0, 10, "Записи отсутствуют", ln=True, align="C")
+    else:
+        for r in records:
+            label = type_labels.get(r.record_type, r.record_type)
+            pdf.set_fill_color(232, 245, 238)
+            pdf.set_font(base_font, "B", 12)
+            pdf.cell(0, 8, f"{r.title}  [{label}]", ln=True, fill=True)
+            pdf.set_font(base_font, "", 10)
+            pdf.set_text_color(80, 80, 80)
+            dates = f"Дата: {r.record_date}"
+            if r.next_date:
+                dates += f"   |   Следующая: {r.next_date}"
+            pdf.cell(0, 6, dates, ln=True)
+            if r.description:
+                pdf.set_text_color(40, 40, 40)
+                pdf.multi_cell(0, 6, r.description)
+            pdf.set_text_color(0, 0, 0)
+            pdf.ln(3)
+
+    # Подвал
+    pdf.set_y(-15)
+    pdf.set_font(base_font, "", 8)
+    pdf.set_text_color(150, 150, 150)
+    pdf.cell(0, 5, f"Сформировано: {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC  |  PawCare", align="C")
+
+    pdf_bytes = pdf.output(dest="S")
+    if isinstance(pdf_bytes, str):
+        pdf_bytes = pdf_bytes.encode("latin-1")
+
+    filename = f"health_{pet.name}_{date.today()}.pdf"
+    return StreamingResponse(
+        io.BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 # WEIGHT
 @app.get("/api/v1/pets/{pet_id}/weight", response_model=List[WeightResponse])
@@ -352,7 +528,9 @@ def add_weight(pet_id: str, data: WeightCreate,
     if not pet:
         raise HTTPException(status_code=404, detail="Питомец не найден")
     log = WeightLog(pet_id=pet_id, weight_kg=data.weight_kg)
-    db.add(log); db.commit(); db.refresh(log)
+    db.add(log)
+    db.commit()
+    db.refresh(log)
     return WeightResponse(id=log.id, weight_kg=log.weight_kg, measured_at=str(log.measured_at))
 
 # REMINDERS
@@ -392,9 +570,15 @@ def get_reminders(current_user: User = Depends(get_current_user), db: Session = 
             })
 
     # Пользовательские
-    custom = db.query(Reminder).filter(Reminder.user_id == current_user.id).all()
+    custom = db.query(Reminder).filter(
+        Reminder.user_id == current_user.id, Reminder.is_done == False
+    ).all()
+    pet_ids = {r.pet_id for r in custom}
+    pets_by_id = {
+        p.id: p for p in db.query(Pet).filter(Pet.id.in_(pet_ids)).all()
+    } if pet_ids else {}
     for r in custom:
-        pet = db.query(Pet).filter(Pet.id == r.pet_id).first()
+        pet = pets_by_id.get(r.pet_id)
         reminders.append({
             "id":          r.id,
             "pet_name":    pet.name if pet else "Питомец",
@@ -404,6 +588,7 @@ def get_reminders(current_user: User = Depends(get_current_user), db: Session = 
             "next_date":   r.remind_at,
             "remind_at":   r.remind_at,
             "source":      "custom",
+            "repeat_rule": r.repeat_rule,
         })
 
     reminders.sort(key=lambda x: x["remind_at"] or "")
@@ -415,10 +600,14 @@ def create_reminder(data: ReminderCreate,
     reminder = Reminder(
         pet_id=data.pet_id, user_id=current_user.id,
         title=data.title, remind_at=data.remind_at,
+        repeat_rule=data.repeat_rule,
     )
-    db.add(reminder); db.commit(); db.refresh(reminder)
+    db.add(reminder)
+    db.commit()
+    db.refresh(reminder)
     return {"id": reminder.id, "title": reminder.title,
-            "remind_at": reminder.remind_at, "pet_id": reminder.pet_id}
+            "remind_at": reminder.remind_at, "pet_id": reminder.pet_id,
+            "repeat_rule": reminder.repeat_rule}
 
 @app.delete("/api/v1/reminders/{reminder_id}")
 def delete_reminder(reminder_id: str,
@@ -428,8 +617,53 @@ def delete_reminder(reminder_id: str,
     ).first()
     if not reminder:
         raise HTTPException(status_code=404, detail="Напоминание не найдено")
-    db.delete(reminder); db.commit()
+    db.delete(reminder)
+    db.commit()
     return {"message": "Напоминание удалено"}
+
+@app.put("/api/v1/reminders/{reminder_id}/done")
+def complete_reminder(reminder_id: str,
+                      current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    reminder = db.query(Reminder).filter(
+        Reminder.id == reminder_id, Reminder.user_id == current_user.id
+    ).first()
+    if not reminder:
+        raise HTTPException(status_code=404, detail="Напоминание не найдено")
+    reminder.is_done = True
+
+    if reminder.repeat_rule:
+        try:
+            from calendar import monthrange
+            dt = datetime.fromisoformat(reminder.remind_at)
+            rule = reminder.repeat_rule
+            if rule == 'daily':
+                from datetime import timedelta as td
+                next_dt = dt + td(days=1)
+            elif rule == 'weekly':
+                from datetime import timedelta as td
+                next_dt = dt + td(weeks=1)
+            elif rule == 'monthly':
+                m, y = dt.month + 1, dt.year
+                if m > 12:
+                    m, y = 1, y + 1
+                max_day = monthrange(y, m)[1]
+                next_dt = dt.replace(year=y, month=m, day=min(dt.day, max_day))
+            elif rule == 'yearly':
+                next_dt = dt.replace(year=dt.year + 1)
+            else:
+                next_dt = None
+            if next_dt:
+                new_r = Reminder(
+                    pet_id=reminder.pet_id, user_id=reminder.user_id,
+                    title=reminder.title, remind_at=next_dt.isoformat(),
+                    repeat_rule=reminder.repeat_rule,
+                )
+                db.add(new_r)
+        except Exception:
+            pass
+
+    db.commit()
+    return {"message": "Выполнено"}
 
 # MAP
 @app.get("/api/v1/map/vets")
@@ -447,15 +681,14 @@ async def get_vets(lat: float, lon: float, current_user: User = Depends(get_curr
 
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.get(url, params=params,
-                                        headers=headers, timeout=10)
+            response = await client.get(url, params=params, headers=headers, timeout=10)
             data = response.json()
             clinics = []
             for item in data:
                 addr = item.get("address", {})
-                road    = addr.get("road", "")
-                house   = addr.get("house_number", "")
-                city    = addr.get("city", addr.get("town", addr.get("village", "")))
+                road  = addr.get("road", "")
+                house = addr.get("house_number", "")
+                city  = addr.get("city", addr.get("town", addr.get("village", "")))
                 address = f"{road} {house}, {city}".strip(", ")
                 clinics.append({
                     "name":    item.get("display_name", "Ветклиника").split(",")[0],
@@ -470,7 +703,6 @@ async def get_vets(lat: float, lon: float, current_user: User = Depends(get_curr
             raise HTTPException(status_code=500, detail=f"Ошибка поиска: {str(e)}")
 
 # ── TELEGRAM BOT ────────────────────────────────────────
-TELEGRAM_BOT_TOKEN = "ВАШ_ТОКЕН_ЗДЕСЬ"
 
 class TelegramLinkRequest(BaseModel):
     chat_id: str
@@ -482,8 +714,6 @@ link_codes: dict = {}
 
 @app.post("/api/v1/telegram/generate-code")
 def generate_link_code(current_user: User = Depends(get_current_user)):
-    import random
-    import string
     code = ''.join(random.choices(string.digits, k=6))
     link_codes[code] = current_user.id
     return {"code": code}
@@ -540,6 +770,63 @@ def telegram_status(
         "username": tg.username if tg else None,
     }
 
+@app.get("/api/v1/telegram/health")
+def telegram_get_health(chat_id: str, pet_name: str, db: Session = Depends(get_db)):
+    tg = db.query(TelegramUser).filter(TelegramUser.chat_id == chat_id).first()
+    if not tg:
+        raise HTTPException(status_code=403, detail="Аккаунт не привязан")
+    pet = db.query(Pet).filter(
+        Pet.owner_id == tg.user_id,
+        Pet.is_deleted == False,
+        Pet.name.ilike(pet_name)
+    ).first()
+    if not pet:
+        raise HTTPException(status_code=404, detail="Питомец не найден")
+    records = db.query(HealthRecord).filter(
+        HealthRecord.pet_id == pet.id
+    ).order_by(HealthRecord.record_date.desc()).all()
+    return {
+        "pet_name": pet.name,
+        "records": [
+            {
+                "title": r.title,
+                "record_type": r.record_type,
+                "record_date": r.record_date,
+                "next_date": r.next_date,
+                "description": r.description,
+            }
+            for r in records
+        ]
+    }
+
+@app.get("/api/v1/map/vets-public")
+async def get_vets_public(lat: float, lon: float):
+    """Публичный эндпоинт для бота (без JWT)"""
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {
+        "q": f"ветеринарная клиника",
+        "format": "json",
+        "limit": 10,
+        "viewbox": f"{lon-0.1},{lat+0.1},{lon+0.1},{lat-0.1}",
+        "bounded": 1,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url, params=params,
+                                    headers={"User-Agent": "PawCareBot/1.0"})
+        results = resp.json()
+        clinics = []
+        for r in results:
+            clinics.append({
+                "name": r.get("display_name", "").split(",")[0],
+                "address": ", ".join(r.get("display_name", "").split(",")[1:3]).strip(),
+                "lat": float(r["lat"]),
+                "lon": float(r["lon"]),
+            })
+        return clinics
+    except Exception:
+        return []
+
 @app.get("/api/v1/telegram/pets")
 def telegram_get_pets(chat_id: str, db: Session = Depends(get_db)):
     tg = db.query(TelegramUser).filter(
@@ -591,8 +878,12 @@ def telegram_get_reminders(chat_id: str, db: Session = Depends(get_db)):
     custom = db.query(Reminder).filter(
         Reminder.user_id == tg.user_id
     ).all()
+    custom_pet_ids = {r.pet_id for r in custom}
+    custom_pets_by_id = {
+        p.id: p for p in db.query(Pet).filter(Pet.id.in_(custom_pet_ids)).all()
+    } if custom_pet_ids else {}
     for r in custom:
-        pet = db.query(Pet).filter(Pet.id == r.pet_id).first()
+        pet = custom_pets_by_id.get(r.pet_id)
         reminders.append({
             "pet_name": pet.name if pet else "Питомец",
             "record_type": "custom",
@@ -602,6 +893,63 @@ def telegram_get_reminders(chat_id: str, db: Session = Depends(get_db)):
 
     reminders.sort(key=lambda x: x["remind_at"] or "")
     return reminders
+
+@app.get("/api/v1/telegram/all-due")
+def get_all_due_notifications(db: Session = Depends(get_db)):
+    """Все напоминания на сегодня для всех привязанных пользователей"""
+    today = date.today()
+    tg_users = db.query(TelegramUser).all()
+    result = []
+
+    for tg in tg_users:
+        pets = db.query(Pet).filter(
+            Pet.owner_id == tg.user_id,
+            Pet.is_deleted == False,
+        ).all()
+
+        for pet in pets:
+            records = db.query(HealthRecord).filter(
+                HealthRecord.pet_id == pet.id,
+                HealthRecord.next_date != None,
+            ).all()
+            for r in records:
+                try:
+                    if date.fromisoformat(r.next_date) == today:
+                        result.append({
+                            "chat_id": tg.chat_id,
+                            "title": r.title,
+                            "pet_name": pet.name,
+                            "record_type": r.record_type,
+                            "remind_at": r.next_date,
+                        })
+                except Exception:
+                    continue
+
+        custom = db.query(Reminder).filter(Reminder.user_id == tg.user_id).all()
+        due_custom = []
+        for r in custom:
+            try:
+                if date.fromisoformat(r.remind_at[:10]) == today:
+                    due_custom.append(r)
+            except Exception:
+                continue
+        if due_custom:
+            due_pet_ids = {r.pet_id for r in due_custom}
+            due_pets_by_id = {
+                p.id: p for p in db.query(Pet).filter(Pet.id.in_(due_pet_ids)).all()
+            }
+            for r in due_custom:
+                pet = due_pets_by_id.get(r.pet_id)
+                result.append({
+                    "chat_id": tg.chat_id,
+                    "title": r.title,
+                    "pet_name": pet.name if pet else "Питомец",
+                    "record_type": "custom",
+                    "remind_at": r.remind_at,
+                })
+
+    return result
+
 
 @app.delete("/api/v1/telegram/unlink-by-chat")
 def unlink_by_chat(chat_id: str, db: Session = Depends(get_db)):
