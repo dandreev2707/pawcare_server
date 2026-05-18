@@ -83,6 +83,7 @@ class Pet(Base):
     owner          = relationship("User", back_populates="pets")
     health_records = relationship("HealthRecord", back_populates="pet")
     weight_logs    = relationship("WeightLog", back_populates="pet")
+    heat_cycles    = relationship("HeatCycle", back_populates="pet")
 
 class HealthRecord(Base):
     __tablename__ = "health_records"
@@ -122,6 +123,16 @@ class TelegramUser(Base):
     chat_id    = Column(String, nullable=False)
     username   = Column(String)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+class HeatCycle(Base):
+    __tablename__ = "heat_cycles"
+    id         = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    pet_id     = Column(String, ForeignKey("pets.id"), nullable=False)
+    started_at = Column(String, nullable=False)
+    ended_at   = Column(String)
+    notes      = Column(Text)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    pet        = relationship("Pet", back_populates="heat_cycles")
 
 # Создаём все таблицы
 Base.metadata.create_all(bind=engine)
@@ -225,6 +236,21 @@ class ReminderCreate(BaseModel):
     remind_at:   str
     repeat_rule: Optional[str] = None
 
+class HeatCycleCreate(BaseModel):
+    started_at: str
+    notes:      Optional[str] = None
+
+class HeatCycleUpdate(BaseModel):
+    started_at: Optional[str] = None
+    ended_at:   Optional[str] = None
+    notes:      Optional[str] = None
+
+class HeatCycleResponse(BaseModel):
+    id:         str
+    started_at: str
+    ended_at:   Optional[str] = None
+    notes:      Optional[str] = None
+
 # ── Эндпоинты ───────────────────────────────────────────
 
 @app.get("/")
@@ -317,6 +343,7 @@ def delete_pet(pet_id: str, current_user: User = Depends(get_current_user), db: 
     db.query(HealthRecord).filter(HealthRecord.pet_id == pet_id).delete()
     db.query(WeightLog).filter(WeightLog.pet_id == pet_id).delete()
     db.query(Reminder).filter(Reminder.pet_id == pet_id).delete()
+    db.query(HeatCycle).filter(HeatCycle.pet_id == pet_id).delete()
 
     # Удаляем фото с диска если есть
     if pet.photo_url and pet.photo_url.startswith("/uploads/"):
@@ -417,17 +444,7 @@ def delete_health_record(pet_id: str, record_id: str,
     db.commit()
     return {"message": "Запись удалена"}
 
-@app.get("/api/v1/pets/{pet_id}/health/export")
-def export_health_pdf(pet_id: str,
-                      current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    pet = db.query(Pet).filter(Pet.id == pet_id, Pet.owner_id == current_user.id).first()
-    if not pet:
-        raise HTTPException(status_code=404, detail="Питомец не найден")
-
-    records = db.query(HealthRecord).filter(
-        HealthRecord.pet_id == pet_id
-    ).order_by(HealthRecord.record_date.desc()).all()
-
+def _build_health_pdf(pet, records) -> bytes:
     type_labels = {
         "vaccination":   "Прививка",
         "deworming":     "Дегельминтизация",
@@ -449,7 +466,6 @@ def export_health_pdf(pet_id: str,
     else:
         base_font = "Helvetica"
 
-    # Заголовок
     pdf.set_font(base_font, "B", 18)
     pdf.cell(0, 12, f"Медицинская карта: {pet.name}", ln=True, align="C")
     pdf.set_font(base_font, "", 11)
@@ -466,7 +482,6 @@ def export_health_pdf(pet_id: str,
     pdf.set_text_color(0, 0, 0)
     pdf.ln(4)
 
-    # Линия
     pdf.set_draw_color(44, 110, 73)
     pdf.set_line_width(0.8)
     pdf.line(10, pdf.get_y(), 200, pdf.get_y())
@@ -493,7 +508,6 @@ def export_health_pdf(pet_id: str,
             pdf.set_text_color(0, 0, 0)
             pdf.ln(3)
 
-    # Подвал
     pdf.set_y(-15)
     pdf.set_font(base_font, "", 8)
     pdf.set_text_color(150, 150, 150)
@@ -502,7 +516,19 @@ def export_health_pdf(pet_id: str,
     pdf_bytes = pdf.output(dest="S")
     if isinstance(pdf_bytes, str):
         pdf_bytes = pdf_bytes.encode("latin-1")
+    return pdf_bytes
 
+
+@app.get("/api/v1/pets/{pet_id}/health/export")
+def export_health_pdf(pet_id: str,
+                      current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    pet = db.query(Pet).filter(Pet.id == pet_id, Pet.owner_id == current_user.id).first()
+    if not pet:
+        raise HTTPException(status_code=404, detail="Питомец не найден")
+    records = db.query(HealthRecord).filter(
+        HealthRecord.pet_id == pet_id
+    ).order_by(HealthRecord.record_date.desc()).all()
+    pdf_bytes = _build_health_pdf(pet, records)
     filename = f"health_{pet.name}_{date.today()}.pdf"
     return StreamingResponse(
         io.BytesIO(pdf_bytes),
@@ -532,6 +558,57 @@ def add_weight(pet_id: str, data: WeightCreate,
     db.commit()
     db.refresh(log)
     return WeightResponse(id=log.id, weight_kg=log.weight_kg, measured_at=str(log.measured_at))
+
+# DASHBOARD STATS
+@app.get("/api/v1/dashboard/stats")
+def get_dashboard_stats(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    pets = db.query(Pet).filter(
+        Pet.owner_id == current_user.id, Pet.is_deleted == False
+    ).all()
+    pets_count = len(pets)
+    pet_ids = [p.id for p in pets]
+    pet_names = {p.id: p.name for p in pets}
+
+    now_str = datetime.now().isoformat()
+    next_reminder = (
+        db.query(Reminder)
+        .filter(
+            Reminder.user_id == current_user.id,
+            Reminder.is_done == False,
+            Reminder.remind_at >= now_str,
+        )
+        .order_by(Reminder.remind_at)
+        .first()
+    )
+
+    next_reminder_data = None
+    if next_reminder:
+        next_reminder_data = {
+            "title": next_reminder.title,
+            "remind_at": next_reminder.remind_at,
+            "pet_name": pet_names.get(next_reminder.pet_id, ""),
+        }
+
+    recent_weight = None
+    if pet_ids:
+        wlog = (
+            db.query(WeightLog)
+            .filter(WeightLog.pet_id.in_(pet_ids))
+            .order_by(WeightLog.measured_at.desc())
+            .first()
+        )
+        if wlog:
+            recent_weight = {
+                "pet_name": pet_names.get(wlog.pet_id, ""),
+                "weight_kg": wlog.weight_kg,
+                "measured_at": str(wlog.measured_at),
+            }
+
+    return {
+        "pets_count": pets_count,
+        "next_reminder": next_reminder_data,
+        "recent_weight": recent_weight,
+    }
 
 # REMINDERS
 @app.get("/api/v1/reminders")
@@ -665,42 +742,190 @@ def complete_reminder(reminder_id: str,
     db.commit()
     return {"message": "Выполнено"}
 
+# HEAT CYCLES
+@app.get("/api/v1/pets/{pet_id}/heat-cycles", response_model=List[HeatCycleResponse])
+def get_heat_cycles(pet_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    pet = db.query(Pet).filter(Pet.id == pet_id, Pet.owner_id == current_user.id).first()
+    if not pet:
+        raise HTTPException(status_code=404, detail="Питомец не найден")
+    cycles = db.query(HeatCycle).filter(
+        HeatCycle.pet_id == pet_id
+    ).order_by(HeatCycle.started_at.desc()).all()
+    return [HeatCycleResponse(id=c.id, started_at=c.started_at, ended_at=c.ended_at, notes=c.notes) for c in cycles]
+
+@app.post("/api/v1/pets/{pet_id}/heat-cycles", response_model=HeatCycleResponse)
+def add_heat_cycle(pet_id: str, data: HeatCycleCreate,
+                   current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    pet = db.query(Pet).filter(Pet.id == pet_id, Pet.owner_id == current_user.id).first()
+    if not pet:
+        raise HTTPException(status_code=404, detail="Питомец не найден")
+    cycle = HeatCycle(pet_id=pet_id, started_at=data.started_at, notes=data.notes)
+    db.add(cycle)
+    db.commit()
+    db.refresh(cycle)
+    return HeatCycleResponse(id=cycle.id, started_at=cycle.started_at, ended_at=cycle.ended_at, notes=cycle.notes)
+
+@app.put("/api/v1/pets/{pet_id}/heat-cycles/{cycle_id}", response_model=HeatCycleResponse)
+def update_heat_cycle(pet_id: str, cycle_id: str, data: HeatCycleUpdate,
+                      current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    pet = db.query(Pet).filter(Pet.id == pet_id, Pet.owner_id == current_user.id).first()
+    if not pet:
+        raise HTTPException(status_code=404, detail="Питомец не найден")
+    cycle = db.query(HeatCycle).filter(HeatCycle.id == cycle_id, HeatCycle.pet_id == pet_id).first()
+    if not cycle:
+        raise HTTPException(status_code=404, detail="Запись не найдена")
+    if data.started_at is not None:
+        cycle.started_at = data.started_at
+    if data.ended_at is not None:
+        cycle.ended_at = data.ended_at
+    if data.notes is not None:
+        cycle.notes = data.notes
+    db.commit()
+    db.refresh(cycle)
+    return HeatCycleResponse(id=cycle.id, started_at=cycle.started_at, ended_at=cycle.ended_at, notes=cycle.notes)
+
+@app.delete("/api/v1/pets/{pet_id}/heat-cycles/{cycle_id}")
+def delete_heat_cycle(pet_id: str, cycle_id: str,
+                      current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    pet = db.query(Pet).filter(Pet.id == pet_id, Pet.owner_id == current_user.id).first()
+    if not pet:
+        raise HTTPException(status_code=404, detail="Питомец не найден")
+    cycle = db.query(HeatCycle).filter(HeatCycle.id == cycle_id, HeatCycle.pet_id == pet_id).first()
+    if not cycle:
+        raise HTTPException(status_code=404, detail="Запись не найдена")
+    db.delete(cycle)
+    db.commit()
+    return {"message": "Запись удалена"}
+
 # MAP
-@app.get("/api/v1/map/vets")
-async def get_vets(lat: float, lon: float, current_user: User = Depends(get_current_user)):
+SEARCH_RADIUS_M = 20000  # радиус поиска в метрах (~город)
+
+# OSM-теги для Overpass API (надёжнее Nominatim для поиска POI)
+_OVERPASS_FILTERS = {
+    "vets":         '["amenity"="veterinary"]',
+    "pet_store":    '["shop"="pet"]',
+    "grooming":     '["shop"="pet_grooming"]',
+    "pet_pharmacy": '["shop"~"pet|veterinary"]["name"~"[Аа]птек|[Фф]арм|[Зз]оо", i]',
+    "dog_park":     '["leisure"="dog_park"]',
+}
+
+# Fallback Nominatim-запросы если Overpass вернул 0 результатов
+_NOMINATIM_QUERIES = {
+    "vets":         "ветеринарная клиника",
+    "pet_store":    "зоомагазин",
+    "grooming":     "груминг животных",
+    "pet_pharmacy": "зооаптека",
+    "dog_park":     "площадка для выгула собак",
+}
+
+
+def _parse_overpass(elements: list, place_type: str) -> list:
+    results = []
+    for el in elements:
+        tags = el.get("tags", {})
+        name = (tags.get("name") or tags.get("name:ru") or "").strip()
+        if not name:
+            continue
+        # У way/relation — координаты из center
+        if el["type"] == "node":
+            lat_v = float(el.get("lat", 0))
+            lon_v = float(el.get("lon", 0))
+        else:
+            center = el.get("center", {})
+            lat_v = float(center.get("lat", 0))
+            lon_v = float(center.get("lon", 0))
+        if lat_v == 0 and lon_v == 0:
+            continue
+
+        street  = tags.get("addr:street", "")
+        house   = tags.get("addr:housenumber", "")
+        city    = tags.get("addr:city", tags.get("addr:town", ""))
+        parts   = [p for p in [street, house, city] if p]
+        address = ", ".join(parts) if parts else ""
+
+        phone = (tags.get("phone") or tags.get("contact:phone") or
+                 tags.get("contact:mobile") or "").strip()
+        hours = tags.get("opening_hours", "").strip()
+
+        results.append({
+            "name":       name,
+            "address":    address or "Адрес не указан",
+            "phone":      phone or "Уточните по телефону",
+            "hours":      hours or "Уточните режим работы",
+            "lat":        lat_v,
+            "lon":        lon_v,
+            "place_type": place_type,
+        })
+    return results
+
+
+async def _nominatim_fallback(lat: float, lon: float, place_type: str) -> list:
+    query = _NOMINATIM_QUERIES.get(place_type, "")
+    if not query:
+        return []
     url = "https://nominatim.openstreetmap.org/search"
     params = {
-        "q": "ветеринарная клиника",
+        "q": query,
         "format": "json",
         "limit": 15,
         "addressdetails": 1,
-        "viewbox": f"{lon-0.1},{lat+0.1},{lon+0.1},{lat-0.1}",
-        "bounded": 1,
+        "viewbox": f"{lon-0.05},{lat+0.05},{lon+0.05},{lat-0.05}",
     }
-    headers = {"User-Agent": "PawCare/1.0"}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url, params=params,
+                                    headers={"User-Agent": "PawCare/1.0"})
+            data = resp.json()
+        places = []
+        for item in data:
+            addr  = item.get("address", {})
+            road  = addr.get("road", "")
+            house = addr.get("house_number", "")
+            city  = addr.get("city", addr.get("town", addr.get("village", "")))
+            address = ", ".join(p for p in [road, house, city] if p)
+            places.append({
+                "name":       item.get("display_name", "").split(",")[0],
+                "address":    address or "Адрес не указан",
+                "phone":      "Уточните по телефону",
+                "hours":      "Уточните режим работы",
+                "lat":        float(item.get("lat", lat)),
+                "lon":        float(item.get("lon", lon)),
+                "place_type": place_type,
+            })
+        return places
+    except Exception:
+        return []
 
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.get(url, params=params, headers=headers, timeout=10)
-            data = response.json()
-            clinics = []
-            for item in data:
-                addr = item.get("address", {})
-                road  = addr.get("road", "")
-                house = addr.get("house_number", "")
-                city  = addr.get("city", addr.get("town", addr.get("village", "")))
-                address = f"{road} {house}, {city}".strip(", ")
-                clinics.append({
-                    "name":    item.get("display_name", "Ветклиника").split(",")[0],
-                    "address": address or item.get("display_name", "Адрес не указан"),
-                    "phone":   "Уточните по телефону",
-                    "hours":   "Уточните режим работы",
-                    "lat":     float(item.get("lat", lat)),
-                    "lon":     float(item.get("lon", lon)),
-                })
-            return clinics
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Ошибка поиска: {str(e)}")
+
+@app.get("/api/v1/map/vets")
+async def get_vets(lat: float, lon: float, place_type: str = "vets",
+                   current_user: User = Depends(get_current_user)):
+    osm_filter = _OVERPASS_FILTERS.get(place_type, _OVERPASS_FILTERS["vets"])
+    overpass_query = (
+        f"[out:json][timeout:20];"
+        f"("
+        f"  node{osm_filter}(around:{SEARCH_RADIUS_M},{lat},{lon});"
+        f"  way{osm_filter}(around:{SEARCH_RADIUS_M},{lat},{lon});"
+        f");"
+        f"out body center;"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.post(
+                "https://overpass-api.de/api/interpreter",
+                data={"data": overpass_query},
+                headers={"User-Agent": "PawCare/1.0"},
+            )
+            elements = resp.json().get("elements", [])
+        places = _parse_overpass(elements, place_type)
+    except Exception:
+        places = []
+
+    # Если Overpass не вернул ничего — используем Nominatim как резервный
+    if not places:
+        places = await _nominatim_fallback(lat, lon, place_type)
+
+    return places
 
 # ── TELEGRAM BOT ────────────────────────────────────────
 
@@ -929,7 +1154,8 @@ def get_all_due_notifications(db: Session = Depends(get_db)):
         due_custom = []
         for r in custom:
             try:
-                if date.fromisoformat(r.remind_at[:10]) == today:
+                remind_dt = _parse_remind_at(r.remind_at)
+                if remind_dt.date() == today:
                     due_custom.append(r)
             except Exception:
                 continue
@@ -951,6 +1177,58 @@ def get_all_due_notifications(db: Session = Depends(get_db)):
     return result
 
 
+def _parse_remind_at(s: str) -> datetime:
+    """Парсит строку времени, поддерживая UTC (Z / +00:00) и наивный формат."""
+    s = s.strip().replace('Z', '+00:00')
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        # Fallback: обрезаем миллисекунды и пробуем снова
+        dt = datetime.fromisoformat(s[:19])
+    # Если есть tzinfo — переводим в UTC naive для единообразного сравнения
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+@app.get("/api/v1/telegram/due-in-hour")
+def get_due_in_hour(db: Session = Depends(get_db)):
+    """Напоминания ровно через ~1 час (окно ±5 мин) для всех привязанных пользователей"""
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    window_start = now + timedelta(minutes=50)
+    window_end   = now + timedelta(minutes=70)
+
+    all_reminders = db.query(Reminder).filter(
+        Reminder.is_done == False,
+    ).all()
+
+    # Фильтруем в Python — так корректно обрабатываются оба формата хранения
+    reminders = []
+    for r in all_reminders:
+        try:
+            remind_dt = _parse_remind_at(r.remind_at)
+            if window_start <= remind_dt <= window_end:
+                reminders.append(r)
+        except Exception:
+            continue
+
+    result = []
+    for r in reminders:
+        tg = db.query(TelegramUser).filter(
+            TelegramUser.user_id == r.user_id
+        ).first()
+        if not tg:
+            continue
+        pet = db.query(Pet).filter(Pet.id == r.pet_id).first()
+        result.append({
+            "id":          r.id,
+            "chat_id":    tg.chat_id,
+            "title":      r.title,
+            "pet_name":   pet.name if pet else "Питомец",
+            "remind_at":  r.remind_at,
+            "record_type": "custom",
+        })
+    return result
+
 @app.delete("/api/v1/telegram/unlink-by-chat")
 def unlink_by_chat(chat_id: str, db: Session = Depends(get_db)):
     tg = db.query(TelegramUser).filter(
@@ -961,3 +1239,57 @@ def unlink_by_chat(chat_id: str, db: Session = Depends(get_db)):
     db.delete(tg)
     db.commit()
     return {"message": "Отвязано"}
+
+
+@app.get("/api/v1/telegram/health-by-id")
+def telegram_get_health_by_id(chat_id: str, pet_id: str, db: Session = Depends(get_db)):
+    tg = db.query(TelegramUser).filter(TelegramUser.chat_id == chat_id).first()
+    if not tg:
+        raise HTTPException(status_code=403, detail="Аккаунт не привязан")
+    pet = db.query(Pet).filter(
+        Pet.id == pet_id,
+        Pet.owner_id == tg.user_id,
+        Pet.is_deleted == False,
+    ).first()
+    if not pet:
+        raise HTTPException(status_code=404, detail="Питомец не найден")
+    records = db.query(HealthRecord).filter(
+        HealthRecord.pet_id == pet_id
+    ).order_by(HealthRecord.record_date.desc()).all()
+    return {
+        "pet_name": pet.name,
+        "pet_id": pet.id,
+        "records": [
+            {
+                "title": r.title,
+                "record_type": r.record_type,
+                "record_date": r.record_date,
+                "next_date": r.next_date,
+                "description": r.description,
+            } for r in records
+        ],
+    }
+
+
+@app.get("/api/v1/telegram/pdf")
+def telegram_get_pdf(chat_id: str, pet_id: str, db: Session = Depends(get_db)):
+    tg = db.query(TelegramUser).filter(TelegramUser.chat_id == chat_id).first()
+    if not tg:
+        raise HTTPException(status_code=403, detail="Аккаунт не привязан")
+    pet = db.query(Pet).filter(
+        Pet.id == pet_id,
+        Pet.owner_id == tg.user_id,
+        Pet.is_deleted == False,
+    ).first()
+    if not pet:
+        raise HTTPException(status_code=404, detail="Питомец не найден")
+    records = db.query(HealthRecord).filter(
+        HealthRecord.pet_id == pet_id
+    ).order_by(HealthRecord.record_date.desc()).all()
+    pdf_bytes = _build_health_pdf(pet, records)
+    filename = f"health_{pet.name}_{date.today()}.pdf"
+    return StreamingResponse(
+        io.BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
