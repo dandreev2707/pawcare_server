@@ -518,9 +518,7 @@ def _build_health_pdf(pet, records) -> bytes:
     pdf.set_text_color(150, 150, 150)
     pdf.cell(0, 5, f"Сформировано: {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC  |  PawCare", align="C")
 
-    pdf_bytes = pdf.output(dest="S")
-    if isinstance(pdf_bytes, str):
-        pdf_bytes = pdf_bytes.encode("latin-1")
+    pdf_bytes = bytes(pdf.output())
     return pdf_bytes
 
 
@@ -533,7 +531,10 @@ def export_health_pdf(pet_id: str,
     records = db.query(HealthRecord).filter(
         HealthRecord.pet_id == pet_id
     ).order_by(HealthRecord.record_date.desc()).all()
-    pdf_bytes = _build_health_pdf(pet, records)
+    try:
+        pdf_bytes = _build_health_pdf(pet, records)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка генерации PDF: {str(e)}")
     filename = f"health_{pet.name}_{date.today()}.pdf"
     return StreamingResponse(
         io.BytesIO(pdf_bytes),
