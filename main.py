@@ -853,8 +853,8 @@ def _parse_overpass(elements: list, place_type: str) -> list:
         results.append({
             "name":       name,
             "address":    address or "Адрес не указан",
-            "phone":      phone or "Уточните по телефону",
-            "hours":      hours or "Уточните режим работы",
+            "phone":      phone,
+            "hours":      hours,
             "lat":        lat_v,
             "lon":        lon_v,
             "place_type": place_type,
@@ -889,8 +889,8 @@ async def _nominatim_fallback(lat: float, lon: float, place_type: str) -> list:
             places.append({
                 "name":       item.get("display_name", "").split(",")[0],
                 "address":    address or "Адрес не указан",
-                "phone":      "Уточните по телефону",
-                "hours":      "Уточните режим работы",
+                "phone":      "",
+                "hours":      "",
                 "lat":        float(item.get("lat", lat)),
                 "lon":        float(item.get("lon", lon)),
                 "place_type": place_type,
