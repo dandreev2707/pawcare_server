@@ -25,7 +25,10 @@ import cloudinary.uploader
 load_dotenv()
 
 # ── Настройки ──────────────────────────────────────────
-DATABASE_URL        = os.getenv("DATABASE_URL")
+DATABASE_URL        = os.getenv("DATABASE_URL", "")
+# Railway выдаёт postgres://, SQLAlchemy 2.x требует postgresql://
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 SECRET_KEY          = os.getenv("SECRET_KEY")
 ALGORITHM           = "HS256"
 TOKEN_EXPIRE_MINUTES = 60 * 24 * 7

@@ -221,6 +221,6 @@ __marimo__/
 # Загруженные файлы пользователей
 uploads/
 
-# Шрифты (скачиваются автоматически)
-DejaVuSans.ttf
-DejaVuSans-Bold.ttf
+# Шрифты включены в репозиторий (нужны для PDF)
+# DejaVuSans.ttf
+# DejaVuSans-Bold.ttf
