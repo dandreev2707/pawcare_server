@@ -309,7 +309,9 @@ def get_pets(current_user: User = Depends(get_current_user), db: Session = Depen
 
 @app.post("/api/v1/pets", response_model=PetResponse)
 def create_pet(data: PetCreate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    pet = Pet(owner_id=current_user.id, name=data.name, breed=data.breed,
+    if not data.name or not data.name.strip():
+        raise HTTPException(status_code=422, detail="Имя питомца не может быть пустым")
+    pet = Pet(owner_id=current_user.id, name=data.name.strip(), breed=data.breed,
               birth_date=data.birth_date, sex=data.sex)
     db.add(pet)
     db.commit()
@@ -677,6 +679,10 @@ def get_reminders(current_user: User = Depends(get_current_user), db: Session = 
 @app.post("/api/v1/reminders")
 def create_reminder(data: ReminderCreate,
                     current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    try:
+        datetime.fromisoformat(data.remind_at)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=422, detail="Неверный формат даты. Ожидается ISO 8601 (например, 2025-06-01T10:00:00)")
     reminder = Reminder(
         pet_id=data.pet_id, user_id=current_user.id,
         title=data.title, remind_at=data.remind_at,
