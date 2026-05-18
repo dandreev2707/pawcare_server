@@ -867,12 +867,16 @@ async def _nominatim_fallback(lat: float, lon: float, place_type: str) -> list:
     if not query:
         return []
     url = "https://nominatim.openstreetmap.org/search"
+    # ~20 км в градусах ≈ 0.18 по широте, 0.25 по долготе
+    delta_lat = 0.18
+    delta_lon = 0.25
     params = {
         "q": query,
         "format": "json",
         "limit": 15,
         "addressdetails": 1,
-        "viewbox": f"{lon-0.05},{lat+0.05},{lon+0.05},{lat-0.05}",
+        "viewbox": f"{lon-delta_lon},{lat+delta_lat},{lon+delta_lon},{lat-delta_lat}",
+        "bounded": 1,
     }
     try:
         async with httpx.AsyncClient(timeout=10) as client:
