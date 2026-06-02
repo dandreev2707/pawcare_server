@@ -91,12 +91,19 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Генерирует одноразовый код для входа в приложение PawCare."""
-    chat_id = str(update.effective_chat.id)
+    chat_id    = str(update.effective_chat.id)
+    first_name = update.effective_user.first_name or ""
+    username   = update.effective_user.username or ""
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post(
                 f"{API_URL}/api/v1/telegram/generate-login-code",
-                json={"chat_id": chat_id, "bot_secret": os.getenv("BOT_SECRET", "")},
+                json={
+                    "chat_id":    chat_id,
+                    "bot_secret": os.getenv("BOT_SECRET", ""),
+                    "first_name": first_name,
+                    "username":   username,
+                },
             )
             if resp.status_code == 200:
                 code = resp.json()["code"]
@@ -106,11 +113,6 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"Введите этот код в приложении PawCare на экране входа.\n"
                     f"⏱ Код действителен *15 минут*.",
                     parse_mode="Markdown",
-                )
-            elif resp.status_code == 404:
-                await update.message.reply_text(
-                    "❌ Ваш Telegram не привязан к аккаунту PawCare.\n\n"
-                    "Сначала зарегистрируйтесь в приложении, затем привяжите Telegram в разделе «Профиль».",
                 )
             else:
                 await update.message.reply_text("❌ Ошибка генерации кода. Попробуйте позже.")

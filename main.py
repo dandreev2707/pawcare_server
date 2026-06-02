@@ -2,7 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import FileResponse, StreamingResponse, RedirectResponse, HTMLResponse
-from sqlalchemy import create_engine, Column, String, Boolean, DateTime, Float, Text, ForeignKey
+from sqlalchemy import create_engine, Column, String, Boolean, DateTime, Float, Text, ForeignKey, text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
 from pydantic import BaseModel
 from typing import List, Optional
@@ -25,7 +25,7 @@ import cloudinary.uploader
 
 load_dotenv()
 
-# ── Настройки ──────────────────────────────────────────
+# Настройки
 DATABASE_URL        = os.getenv("DATABASE_URL", "")
 # Railway выдаёт postgres://, SQLAlchemy 2.x требует postgresql://
 if DATABASE_URL.startswith("postgres://"):
@@ -54,7 +54,7 @@ if CLOUDINARY_CLOUD_NAME:
         secure=True,
     )
 
-# ── База данных ─────────────────────────────────────────
+# База данных
 engine       = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base         = declarative_base()
@@ -66,13 +66,14 @@ def get_db():
     finally:
         db.close()
 
-# ── Модели таблиц ───────────────────────────────────────
+# Модели таблиц
 class User(Base):
     __tablename__ = "users"
     id            = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     email         = Column(String, unique=True, nullable=False, index=True)
     name          = Column(String, nullable=False)
-    password_hash = Column(String, nullable=False)
+    password_hash = Column(String, nullable=True)
+    auth_provider = Column(String, default='email')
     is_active     = Column(Boolean, default=True)
     created_at    = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     pets          = relationship("Pet", back_populates="owner")
@@ -160,7 +161,13 @@ class GoogleOAuthState(Base):
 # Создаём все таблицы
 Base.metadata.create_all(bind=engine)
 
-# ── Приложение ──────────────────────────────────────────
+# Миграция: обновляем существующую БД
+with engine.connect() as _conn:
+    _conn.execute(text("ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL"))
+    _conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_provider VARCHAR DEFAULT 'email'"))
+    _conn.commit()
+
+# Приложение
 app = FastAPI(title="PawCare API", version="1.0.0")
 
 app.add_middleware(
@@ -174,7 +181,7 @@ app.add_middleware(
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds=12)
 security    = HTTPBearer()
 
-# ── Вспомогательные функции ─────────────────────────────
+# Вспомогательные функции
 def create_token(user_id: str) -> str:
     expire = datetime.now(timezone.utc) + timedelta(minutes=TOKEN_EXPIRE_MINUTES)
     return jwt.encode({"sub": user_id, "exp": expire}, SECRET_KEY, algorithm=ALGORITHM)
@@ -193,7 +200,7 @@ def get_current_user(
         raise HTTPException(status_code=401, detail="Пользователь не найден")
     return user
 
-# ── Pydantic схемы ──────────────────────────────────────
+# Pydantic схемы
 class RegisterRequest(BaseModel):
     name: str
     email: str
@@ -228,7 +235,7 @@ class PetResponse(BaseModel):
     breed:      Optional[str] = None
     birth_date: Optional[str] = None
     sex:        Optional[str] = None
-    photo_url:  Optional[str] = None  
+    photo_url:  Optional[str] = None
 
 class HealthRecordCreate(BaseModel):
     record_type: str
@@ -281,6 +288,8 @@ class TelegramLoginRequest(BaseModel):
 class TelegramLoginCodeRequest(BaseModel):
     chat_id:    str
     bot_secret: Optional[str] = None
+    first_name: Optional[str] = None
+    username:   Optional[str] = None
 
 class HeatCycleCreate(BaseModel):
     started_at: str
@@ -297,7 +306,7 @@ class HeatCycleResponse(BaseModel):
     ended_at:   Optional[str] = None
     notes:      Optional[str] = None
 
-# ── Эндпоинты ───────────────────────────────────────────
+# Эндпоинты
 
 @app.get("/")
 def root():
@@ -316,6 +325,7 @@ def register(request: RegisterRequest, db: Session = Depends(get_db)):
         email=request.email,
         name=request.name,
         password_hash=pwd_context.hash(request.password),
+        auth_provider='email',
     )
     db.add(user)
     db.commit()
@@ -329,7 +339,7 @@ def register(request: RegisterRequest, db: Session = Depends(get_db)):
 @app.post("/api/v1/auth/login", response_model=TokenResponse)
 def login(request: LoginRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == request.email).first()
-    if not user or not pwd_context.verify(request.password, user.password_hash):
+    if not user or not user.password_hash or not pwd_context.verify(request.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Неверный email или пароль")
     return TokenResponse(
         access_token=create_token(user.id),
@@ -339,7 +349,7 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
 
 @app.get("/api/v1/auth/me")
 def get_me(current_user: User = Depends(get_current_user)):
-    return {"user_id": current_user.id, "name": current_user.name, "email": current_user.email}
+    return {"user_id": current_user.id, "name": current_user.name, "email": current_user.email, "auth_provider": current_user.auth_provider or "email"}
 
 # GOOGLE OAUTH
 @app.get("/api/v1/auth/google/initiate")
@@ -404,7 +414,7 @@ async def google_callback(code: str, state: str, db: Session = Depends(get_db)):
         user = User(
             email=email,
             name=name,
-            password_hash=pwd_context.hash(str(uuid.uuid4())),
+            auth_provider='google',
         )
         db.add(user)
         db.commit()
@@ -494,7 +504,22 @@ def generate_telegram_login_code(req: TelegramLoginCodeRequest, db: Session = De
         TelegramUser.chat_id == req.chat_id
     ).first()
     if not tg_user:
-        raise HTTPException(status_code=404, detail="Telegram аккаунт не привязан")
+        # Авторегистрация: создаём аккаунт по Telegram ID
+        name = req.first_name or req.username or "Telegram User"
+        email = f"tg_{req.chat_id}@telegram.local"
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            user = User(email=email, name=name, auth_provider='telegram')
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+        tg_user = TelegramUser(
+            user_id=user.id,
+            chat_id=req.chat_id,
+            username=req.username,
+        )
+        db.add(tg_user)
+        db.commit()
     code = "".join(random.choices(string.digits, k=6))
     db.add(TelegramLoginCode(chat_id=req.chat_id, code=code))
     db.commit()
@@ -970,11 +995,9 @@ def complete_reminder(reminder_id: str,
             dt = datetime.fromisoformat(reminder.remind_at)
             rule = reminder.repeat_rule
             if rule == 'daily':
-                from datetime import timedelta as td
-                next_dt = dt + td(days=1)
+                next_dt = dt + timedelta(days=1)
             elif rule == 'weekly':
-                from datetime import timedelta as td
-                next_dt = dt + td(weeks=1)
+                next_dt = dt + timedelta(weeks=1)
             elif rule == 'monthly':
                 m, y = dt.month + 1, dt.year
                 if m > 12:
@@ -1187,7 +1210,7 @@ async def get_vets(lat: float, lon: float, place_type: str = "vets",
 
     return places
 
-# ── TELEGRAM BOT ────────────────────────────────────────
+# TELEGRAM BOT
 
 class TelegramLinkRequest(BaseModel):
     chat_id: str
@@ -1289,7 +1312,7 @@ async def get_vets_public(lat: float, lon: float):
     """Публичный эндпоинт для бота (без JWT)"""
     url = "https://nominatim.openstreetmap.org/search"
     params = {
-        "q": f"ветеринарная клиника",
+        "q": "ветеринарная клиника",
         "format": "json",
         "limit": 10,
         "viewbox": f"{lon-0.1},{lat+0.1},{lon+0.1},{lat-0.1}",
@@ -1555,7 +1578,7 @@ def telegram_get_pdf(chat_id: str, pet_id: str, db: Session = Depends(get_db)):
     )
 
 
-# ── APScheduler: фоновые задачи ─────────────────────────
+# APScheduler: фоновые задачи
 def _cleanup_expired_codes():
     """Удаляет просроченные коды входа (старше 15 мин) и OAuth-состояния (старше 10 мин)."""
     db = SessionLocal()
