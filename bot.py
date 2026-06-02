@@ -77,6 +77,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📋 *Доступные команды:*\n\n"
+        "/login — Войти в приложение PawCare\n"
         "/pets — Мои питомцы\n"
         "/remind — Ближайшие напоминания\n"
         "/health — Медкарта питомца\n"
@@ -87,6 +88,36 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/help — Справка",
         parse_mode="Markdown"
     )
+
+async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Генерирует одноразовый код для входа в приложение PawCare."""
+    chat_id = str(update.effective_chat.id)
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(
+                f"{API_URL}/api/v1/telegram/generate-login-code",
+                json={"chat_id": chat_id, "bot_secret": os.getenv("BOT_SECRET", "")},
+            )
+            if resp.status_code == 200:
+                code = resp.json()["code"]
+                await update.message.reply_text(
+                    f"🔑 *Код для входа в PawCare:*\n\n"
+                    f"`{code}`\n\n"
+                    f"Введите этот код в приложении PawCare на экране входа.\n"
+                    f"⏱ Код действителен *15 минут*.",
+                    parse_mode="Markdown",
+                )
+            elif resp.status_code == 404:
+                await update.message.reply_text(
+                    "❌ Ваш Telegram не привязан к аккаунту PawCare.\n\n"
+                    "Сначала зарегистрируйтесь в приложении, затем привяжите Telegram в разделе «Профиль».",
+                )
+            else:
+                await update.message.reply_text("❌ Ошибка генерации кода. Попробуйте позже.")
+        except Exception as e:
+            logging.error(f"login_command error: {e}")
+            await update.message.reply_text("❌ Сервер недоступен. Попробуйте позже.")
+
 
 async def link_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -589,6 +620,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("login", login_command))
     app.add_handler(CommandHandler("link", link_command))
     app.add_handler(CommandHandler("code", code_command))
     app.add_handler(CommandHandler("pets", pets_command))

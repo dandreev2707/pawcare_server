@@ -1,16 +1,17 @@
 from fastapi import FastAPI, Depends, HTTPException, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, RedirectResponse, HTMLResponse
 from sqlalchemy import create_engine, Column, String, Boolean, DateTime, Float, Text, ForeignKey
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session, relationship
+from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
 from pydantic import BaseModel
 from typing import List, Optional
 from passlib.context import CryptContext
 from jose import jwt, JWTError
 from datetime import datetime, timedelta, date, timezone
 from dotenv import load_dotenv
+from apscheduler.schedulers.background import BackgroundScheduler
+import atexit
 import uuid
 import os
 import random
@@ -34,6 +35,10 @@ ALGORITHM           = "HS256"
 TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
 UPLOAD_DIR          = "uploads"
 YANDEX_API_KEY      = os.getenv("YANDEX_API_KEY", "")
+GOOGLE_CLIENT_ID    = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8001/api/v1/auth/google/callback")
+BOT_SECRET          = os.getenv("BOT_SECRET", "")
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -137,6 +142,21 @@ class HeatCycle(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     pet        = relationship("Pet", back_populates="heat_cycles")
 
+class TelegramLoginCode(Base):
+    __tablename__ = "telegram_login_codes"
+    id         = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    chat_id    = Column(String, nullable=False, index=True)
+    code       = Column(String, nullable=False, unique=True)
+    is_used    = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+class GoogleOAuthState(Base):
+    __tablename__ = "google_oauth_states"
+    id         = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    state      = Column(String, nullable=False, unique=True)
+    jwt_token  = Column(String)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
 # Создаём все таблицы
 Base.metadata.create_all(bind=engine)
 
@@ -151,7 +171,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds=12)
 security    = HTTPBearer()
 
 # ── Вспомогательные функции ─────────────────────────────
@@ -239,6 +259,29 @@ class ReminderCreate(BaseModel):
     remind_at:   str
     repeat_rule: Optional[str] = None
 
+class ReminderResponse(BaseModel):
+    id: str
+    pet_id: str
+    title: str
+    remind_at: str
+    repeat_rule: Optional[str] = None
+
+class HealthRecordUpdate(BaseModel):
+    title:       Optional[str] = None
+    description: Optional[str] = None
+    record_date: Optional[str] = None
+    next_date:   Optional[str] = None
+
+class GoogleCodeExchangeRequest(BaseModel):
+    code: str
+
+class TelegramLoginRequest(BaseModel):
+    code: str
+
+class TelegramLoginCodeRequest(BaseModel):
+    chat_id:    str
+    bot_secret: Optional[str] = None
+
 class HeatCycleCreate(BaseModel):
     started_at: str
     notes:      Optional[str] = None
@@ -298,6 +341,165 @@ def login(request: LoginRequest, db: Session = Depends(get_db)):
 def get_me(current_user: User = Depends(get_current_user)):
     return {"user_id": current_user.id, "name": current_user.name, "email": current_user.email}
 
+# GOOGLE OAUTH
+@app.get("/api/v1/auth/google/initiate")
+def google_initiate(db: Session = Depends(get_db)):
+    """Перенаправляет пользователя на страницу авторизации Google."""
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=503, detail="Google OAuth не настроен (GOOGLE_CLIENT_ID отсутствует)")
+    state = "".join(random.choices(string.ascii_letters + string.digits, k=32))
+    db.add(GoogleOAuthState(state=state))
+    db.commit()
+    google_url = (
+        "https://accounts.google.com/o/oauth2/v2/auth"
+        f"?client_id={GOOGLE_CLIENT_ID}"
+        f"&redirect_uri={GOOGLE_REDIRECT_URI}"
+        "&response_type=code"
+        "&scope=openid%20email%20profile"
+        f"&state={state}"
+    )
+    return RedirectResponse(url=google_url)
+
+@app.get("/api/v1/auth/google/callback")
+async def google_callback(code: str, state: str, db: Session = Depends(get_db)):
+    """Принимает код от Google, выдаёт JWT и возвращает HTML-страницу с кодом."""
+    oauth_state = db.query(GoogleOAuthState).filter(
+        GoogleOAuthState.state == state,
+        GoogleOAuthState.jwt_token == None,  # noqa
+    ).first()
+    if not oauth_state:
+        raise HTTPException(status_code=400, detail="Неверный state параметр")
+
+    async with httpx.AsyncClient() as client:
+        token_resp = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "code": code,
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "redirect_uri": GOOGLE_REDIRECT_URI,
+                "grant_type": "authorization_code",
+            },
+        )
+        if token_resp.status_code != 200:
+            raise HTTPException(status_code=401, detail="Ошибка обмена кода Google")
+        token_data = token_resp.json()
+        id_token   = token_data.get("id_token", "")
+
+        info_resp = await client.get(
+            "https://oauth2.googleapis.com/tokeninfo",
+            params={"id_token": id_token},
+        )
+        if info_resp.status_code != 200:
+            raise HTTPException(status_code=401, detail="Неверный Google id_token")
+        info = info_resp.json()
+
+    email = info.get("email")
+    name  = info.get("name") or (email.split("@")[0] if email else "User")
+    if not email:
+        raise HTTPException(status_code=400, detail="Email не получен от Google")
+
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        user = User(
+            email=email,
+            name=name,
+            password_hash=pwd_context.hash(str(uuid.uuid4())),
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+    jwt_token = create_token(user.id)
+    oauth_state.jwt_token = jwt_token
+    db.commit()
+
+    # Показываем короткий state-код (первые 8 символов) для ввода в приложении
+    display_code = state[:8]
+    return HTMLResponse(content=f"""
+    <html><head><meta charset="utf-8"><title>PawCare — авторизация</title>
+    <style>body{{font-family:sans-serif;display:flex;flex-direction:column;align-items:center;
+    justify-content:center;min-height:100vh;background:#f0faf4;margin:0}}
+    .card{{background:white;border-radius:16px;padding:40px;text-align:center;box-shadow:0 4px 24px rgba(0,0,0,.08)}}
+    h2{{color:#2C6E49}} .code{{font-size:32px;font-weight:700;letter-spacing:6px;color:#2C6E49;
+    background:#E8F5EE;padding:16px 32px;border-radius:12px;margin:16px 0}}</style></head>
+    <body><div class="card">
+    <h2>✅ Авторизация через Google успешна!</h2>
+    <p>Введите этот код в приложении PawCare:</p>
+    <div class="code">{display_code}</div>
+    <p style="color:#888;font-size:13px">Код действителен 10 минут</p>
+    </div></body></html>
+    """)
+
+@app.post("/api/v1/auth/google/exchange", response_model=TokenResponse)
+def google_exchange(req: GoogleCodeExchangeRequest, db: Session = Depends(get_db)):
+    """Обменивает 8-символьный код на JWT токен."""
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=10)
+    oauth_state = db.query(GoogleOAuthState).filter(
+        GoogleOAuthState.state.like(f"{req.code}%"),
+        GoogleOAuthState.jwt_token != None,  # noqa
+        GoogleOAuthState.created_at > cutoff,
+    ).first()
+    if not oauth_state:
+        raise HTTPException(status_code=401, detail="Неверный или устаревший код Google авторизации")
+
+    payload = jwt.decode(oauth_state.jwt_token, SECRET_KEY, algorithms=[ALGORITHM])
+    user_id = payload.get("sub")
+    user    = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+
+    db.delete(oauth_state)
+    db.commit()
+    return TokenResponse(
+        access_token=create_token(user.id),
+        token_type="bearer",
+        user_id=user.id, name=user.name, email=user.email,
+    )
+
+# TELEGRAM LOGIN
+@app.post("/api/v1/auth/telegram-login", response_model=TokenResponse)
+def telegram_login(req: TelegramLoginRequest, db: Session = Depends(get_db)):
+    """Вход по коду, полученному от Telegram-бота командой /login."""
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
+    login_code = db.query(TelegramLoginCode).filter(
+        TelegramLoginCode.code == req.code,
+        TelegramLoginCode.is_used == False,  # noqa
+        TelegramLoginCode.created_at > cutoff,
+    ).first()
+    if not login_code:
+        raise HTTPException(status_code=401, detail="Неверный или устаревший код")
+    tg_user = db.query(TelegramUser).filter(
+        TelegramUser.chat_id == login_code.chat_id
+    ).first()
+    if not tg_user:
+        raise HTTPException(status_code=401, detail="Telegram аккаунт не привязан к PawCare")
+    user = db.query(User).filter(User.id == tg_user.user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    login_code.is_used = True
+    db.commit()
+    return TokenResponse(
+        access_token=create_token(user.id),
+        token_type="bearer",
+        user_id=user.id, name=user.name, email=user.email,
+    )
+
+@app.post("/api/v1/telegram/generate-login-code")
+def generate_telegram_login_code(req: TelegramLoginCodeRequest, db: Session = Depends(get_db)):
+    """Генерирует 6-значный код входа для Telegram-бота (внутренний эндпоинт)."""
+    if BOT_SECRET and req.bot_secret != BOT_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    tg_user = db.query(TelegramUser).filter(
+        TelegramUser.chat_id == req.chat_id
+    ).first()
+    if not tg_user:
+        raise HTTPException(status_code=404, detail="Telegram аккаунт не привязан")
+    code = "".join(random.choices(string.digits, k=6))
+    db.add(TelegramLoginCode(chat_id=req.chat_id, code=code))
+    db.commit()
+    return {"code": code}
+
 # PETS
 @app.get("/api/v1/pets", response_model=List[PetResponse])
 def get_pets(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -350,11 +552,17 @@ def delete_pet(pet_id: str, current_user: User = Depends(get_current_user), db: 
     db.query(Reminder).filter(Reminder.pet_id == pet_id).delete()
     db.query(HeatCycle).filter(HeatCycle.pet_id == pet_id).delete()
 
-    # Удаляем фото с диска если есть
-    if pet.photo_url and pet.photo_url.startswith("/uploads/"):
-        filepath = os.path.join(UPLOAD_DIR, os.path.basename(pet.photo_url))
-        if os.path.exists(filepath):
-            os.remove(filepath)
+    # Удаляем фото: с Cloudinary или с диска
+    if pet.photo_url:
+        if pet.photo_url.startswith("http") and CLOUDINARY_CLOUD_NAME:
+            try:
+                cloudinary.uploader.destroy(f"pawcare/pets/{pet_id}")
+            except Exception:
+                pass
+        elif pet.photo_url.startswith("/uploads/"):
+            filepath = os.path.join(UPLOAD_DIR, os.path.basename(pet.photo_url))
+            if os.path.exists(filepath):
+                os.remove(filepath)
 
     db.delete(pet)
     db.commit()
@@ -372,25 +580,23 @@ async def upload_pet_photo(
         raise HTTPException(status_code=404, detail="Питомец не найден")
     contents = await file.read()
 
-    # Всегда сохраняем локально (для работы в локальной сети)
-    ext      = file.filename.split(".")[-1] if "." in file.filename else "jpg"
-    filename = f"{pet_id}.{ext}"
-    filepath = os.path.join(UPLOAD_DIR, filename)
-    with open(filepath, "wb") as f:
-        f.write(contents)
-    pet.photo_url = f"/uploads/{filename}"
-
-    # Дополнительно загружаем в Cloudinary как резерв (не блокирует ответ)
     if CLOUDINARY_CLOUD_NAME:
-        try:
-            cloudinary.uploader.upload(
-                contents,
-                public_id=f"pawcare/pets/{pet_id}",
-                overwrite=True,
-                resource_type="image",
-            )
-        except Exception:
-            pass
+        # Cloudinary: сохраняем только в облаке, URL берём оттуда
+        result = cloudinary.uploader.upload(
+            contents,
+            public_id=f"pawcare/pets/{pet_id}",
+            overwrite=True,
+            resource_type="image",
+        )
+        pet.photo_url = result["secure_url"]
+    else:
+        # Локальный режим: сохраняем на диск
+        ext      = file.filename.split(".")[-1] if "." in file.filename else "jpg"
+        filename = f"{pet_id}.{ext}"
+        filepath = os.path.join(UPLOAD_DIR, filename)
+        with open(filepath, "wb") as f:
+            f.write(contents)
+        pet.photo_url = f"/uploads/{filename}"
 
     db.commit()
     return {"photo_url": pet.photo_url}
@@ -434,6 +640,32 @@ def add_health(pet_id: str, data: HealthRecordCreate,
         description=record.description, record_date=record.record_date, next_date=record.next_date
     )
 
+@app.put("/api/v1/pets/{pet_id}/health/{record_id}", response_model=HealthRecordResponse)
+def update_health_record(pet_id: str, record_id: str, data: HealthRecordUpdate,
+                         current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    pet = db.query(Pet).filter(Pet.id == pet_id, Pet.owner_id == current_user.id).first()
+    if not pet:
+        raise HTTPException(status_code=404, detail="Питомец не найден")
+    record = db.query(HealthRecord).filter(
+        HealthRecord.id == record_id, HealthRecord.pet_id == pet_id
+    ).first()
+    if not record:
+        raise HTTPException(status_code=404, detail="Запись не найдена")
+    if data.title is not None:
+        record.title = data.title
+    if data.description is not None:
+        record.description = data.description
+    if data.record_date is not None:
+        record.record_date = data.record_date
+    if data.next_date is not None:
+        record.next_date = data.next_date
+    db.commit()
+    db.refresh(record)
+    return HealthRecordResponse(
+        id=record.id, record_type=record.record_type, title=record.title,
+        description=record.description, record_date=record.record_date, next_date=record.next_date,
+    )
+
 @app.delete("/api/v1/pets/{pet_id}/health/{record_id}")
 def delete_health_record(pet_id: str, record_id: str,
                          current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -455,7 +687,7 @@ def _build_health_pdf(pet, records) -> bytes:
         "deworming":     "Дегельминтизация",
         "antiparasitic": "Обработка от паразитов",
         "vet_visit":     "Визит к врачу",
-        "chronic":       "Хроническое заболевание",
+        "chronic_disease": "Хроническое заболевание",
         "medication":    "Медикамент",
     }
 
@@ -564,6 +796,19 @@ def add_weight(pet_id: str, data: WeightCreate,
     db.commit()
     db.refresh(log)
     return WeightResponse(id=log.id, weight_kg=log.weight_kg, measured_at=str(log.measured_at))
+
+@app.delete("/api/v1/pets/{pet_id}/weight/{weight_id}")
+def delete_weight(pet_id: str, weight_id: str,
+                  current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    pet = db.query(Pet).filter(Pet.id == pet_id, Pet.owner_id == current_user.id).first()
+    if not pet:
+        raise HTTPException(status_code=404, detail="Питомец не найден")
+    log = db.query(WeightLog).filter(WeightLog.id == weight_id, WeightLog.pet_id == pet_id).first()
+    if not log:
+        raise HTTPException(status_code=404, detail="Запись не найдена")
+    db.delete(log)
+    db.commit()
+    return {"message": "Запись удалена"}
 
 # DASHBOARD STATS
 @app.get("/api/v1/dashboard/stats")
@@ -677,7 +922,7 @@ def get_reminders(current_user: User = Depends(get_current_user), db: Session = 
     reminders.sort(key=lambda x: x["remind_at"] or "")
     return reminders
 
-@app.post("/api/v1/reminders")
+@app.post("/api/v1/reminders", response_model=ReminderResponse)
 def create_reminder(data: ReminderCreate,
                     current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     try:
@@ -692,9 +937,10 @@ def create_reminder(data: ReminderCreate,
     db.add(reminder)
     db.commit()
     db.refresh(reminder)
-    return {"id": reminder.id, "title": reminder.title,
-            "remind_at": reminder.remind_at, "pet_id": reminder.pet_id,
-            "repeat_rule": reminder.repeat_rule}
+    return ReminderResponse(
+        id=reminder.id, pet_id=reminder.pet_id, title=reminder.title,
+        remind_at=reminder.remind_at, repeat_rule=reminder.repeat_rule,
+    )
 
 @app.delete("/api/v1/reminders/{reminder_id}")
 def delete_reminder(reminder_id: str,
@@ -1307,3 +1553,48 @@ def telegram_get_pdf(chat_id: str, pet_id: str, db: Session = Depends(get_db)):
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# ── APScheduler: фоновые задачи ─────────────────────────
+def _cleanup_expired_codes():
+    """Удаляет просроченные коды входа (старше 15 мин) и OAuth-состояния (старше 10 мин)."""
+    db = SessionLocal()
+    try:
+        tg_cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
+        db.query(TelegramLoginCode).filter(
+            TelegramLoginCode.created_at < tg_cutoff
+        ).delete(synchronize_session=False)
+
+        google_cutoff = datetime.now(timezone.utc) - timedelta(minutes=10)
+        db.query(GoogleOAuthState).filter(
+            GoogleOAuthState.created_at < google_cutoff
+        ).delete(synchronize_session=False)
+
+        db.commit()
+    finally:
+        db.close()
+
+
+def _mark_overdue_reminders():
+    """Помечает просроченные однократные напоминания как выполненные."""
+    db = SessionLocal()
+    try:
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M")
+        overdue = db.query(Reminder).filter(
+            Reminder.is_done == False,  # noqa
+            Reminder.repeat_rule == None,  # noqa
+            Reminder.remind_at < now_str,
+        ).all()
+        for r in overdue:
+            r.is_done = True
+        if overdue:
+            db.commit()
+    finally:
+        db.close()
+
+
+_scheduler = BackgroundScheduler(timezone="Europe/Moscow")
+_scheduler.add_job(_cleanup_expired_codes,  "interval", minutes=5,  id="cleanup_codes")
+_scheduler.add_job(_mark_overdue_reminders, "interval", minutes=10, id="mark_overdue")
+_scheduler.start()
+atexit.register(lambda: _scheduler.shutdown(wait=False))
