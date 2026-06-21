@@ -4,7 +4,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import FileResponse, StreamingResponse, RedirectResponse, HTMLResponse
 from sqlalchemy import create_engine, Column, String, Boolean, DateTime, Float, Text, ForeignKey, text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from typing import List, Optional
 from passlib.context import CryptContext
 from jose import jwt, JWTError
@@ -20,6 +20,7 @@ import shutil
 import httpx
 import io
 from fpdf import FPDF
+from fpdf.enums import XPos, YPos
 import cloudinary
 import cloudinary.uploader
 
@@ -254,6 +255,13 @@ class HealthRecordResponse(BaseModel):
 
 class WeightCreate(BaseModel):
     weight_kg: float
+
+    @field_validator("weight_kg")
+    @classmethod
+    def weight_must_be_positive(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError("Вес должен быть больше 0")
+        return v
 
 class WeightResponse(BaseModel):
     id: str
@@ -600,8 +608,8 @@ async def upload_pet_photo(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    pet = db.query(Pet).filter(Pet.id == pet_id, Pet.owner_id == current_user.id).first()
-    if not pet:
+        pet = db.query(Pet).filter(Pet.id == pet_id, Pet.owner_id == current_user.id).first()
+        if not pet:
         raise HTTPException(status_code=404, detail="Питомец не найден")
     contents = await file.read()
 
@@ -722,14 +730,15 @@ def _build_health_pdf(pet, records) -> bytes:
     font_path = os.path.join(os.path.dirname(__file__), "DejaVuSans.ttf")
     bold_path = os.path.join(os.path.dirname(__file__), "DejaVuSans-Bold.ttf")
     if os.path.exists(font_path):
-        pdf.add_font("DejaVu", "", font_path, uni=True)
-        pdf.add_font("DejaVu", "B", bold_path if os.path.exists(bold_path) else font_path, uni=True)
+        pdf.add_font("DejaVu", "", font_path)
+        pdf.add_font("DejaVu", "B", bold_path if os.path.exists(bold_path) else font_path)
         base_font = "DejaVu"
     else:
         base_font = "Helvetica"
 
     pdf.set_font(base_font, "B", 18)
-    pdf.cell(0, 12, f"Медицинская карта: {pet.name}", ln=True, align="C")
+    pdf.cell(0, 12, f"Медицинская карта: {pet.name}", align="C",
+             new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_font(base_font, "", 11)
     pdf.set_text_color(100, 100, 100)
     info_parts = []
@@ -740,7 +749,8 @@ def _build_health_pdf(pet, records) -> bytes:
     if pet.sex:
         info_parts.append("Мальчик" if pet.sex == "male" else "Девочка")
     if info_parts:
-        pdf.cell(0, 7, "  |  ".join(info_parts), ln=True, align="C")
+        pdf.cell(0, 7, "  |  ".join(info_parts), align="C",
+                 new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_text_color(0, 0, 0)
     pdf.ln(4)
 
@@ -751,19 +761,21 @@ def _build_health_pdf(pet, records) -> bytes:
 
     if not records:
         pdf.set_font(base_font, "", 12)
-        pdf.cell(0, 10, "Записи отсутствуют", ln=True, align="C")
+        pdf.cell(0, 10, "Записи отсутствуют", align="C",
+                 new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     else:
         for r in records:
             label = type_labels.get(r.record_type, r.record_type)
             pdf.set_fill_color(232, 245, 238)
             pdf.set_font(base_font, "B", 12)
-            pdf.cell(0, 8, f"{r.title}  [{label}]", ln=True, fill=True)
+            pdf.cell(0, 8, f"{r.title}  [{label}]", fill=True,
+                     new_x=XPos.LMARGIN, new_y=YPos.NEXT)
             pdf.set_font(base_font, "", 10)
             pdf.set_text_color(80, 80, 80)
             dates = f"Дата: {r.record_date}"
             if r.next_date:
                 dates += f"   |   Следующая: {r.next_date}"
-            pdf.cell(0, 6, dates, ln=True)
+            pdf.cell(0, 6, dates, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
             if r.description:
                 pdf.set_text_color(40, 40, 40)
                 pdf.multi_cell(0, 6, r.description)
@@ -1569,7 +1581,10 @@ def telegram_get_pdf(chat_id: str, pet_id: str, db: Session = Depends(get_db)):
     records = db.query(HealthRecord).filter(
         HealthRecord.pet_id == pet_id
     ).order_by(HealthRecord.record_date.desc()).all()
-    pdf_bytes = _build_health_pdf(pet, records)
+    try:
+        pdf_bytes = _build_health_pdf(pet, records)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка генерации PDF: {str(e)}")
     filename = f"health_{pet.name}_{date.today()}.pdf"
     return StreamingResponse(
         io.BytesIO(pdf_bytes),

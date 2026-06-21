@@ -298,3 +298,225 @@ class TestReminderEndpoints:
         r = client.get("/api/v1/reminders", headers=self.headers)
         assert r.status_code == 200
         assert isinstance(r.json(), list)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UT-17..UT-18  Журнал веса
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestWeightEndpoints:
+    """Юнит-тесты /api/v1/pets/{pet_id}/weight."""
+
+    @classmethod
+    def setup_class(cls):
+        email = f"ut_weight_{TS}@pawcare.test"
+        reg = client.post("/api/v1/auth/register",
+                          json={"name": "WeightOwner", "email": email, "password": "Pass123!"})
+        cls.token = reg.json()["access_token"]
+        cls.headers = {"Authorization": f"Bearer {cls.token}"}
+        r_pet = client.post("/api/v1/pets", json={"name": "ВесПёс"}, headers=cls.headers)
+        cls.pet_id = r_pet.json()["id"]
+
+    def test_ut17_add_weight_entry(self):
+        """UT-17: добавление записи о весе — HTTP 200, weight_kg совпадает."""
+        r = client.post(f"/api/v1/pets/{self.pet_id}/weight",
+                        json={"weight_kg": 24.5},
+                        headers=self.headers)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["weight_kg"] == 24.5
+        assert "id" in body
+        assert "measured_at" in body
+
+    def test_ut17b_get_weight_history(self):
+        """UT-17b: GET истории веса — HTTP 200, список записей."""
+        client.post(f"/api/v1/pets/{self.pet_id}/weight",
+                    json={"weight_kg": 25.0}, headers=self.headers)
+        r = client.get(f"/api/v1/pets/{self.pet_id}/weight", headers=self.headers)
+        assert r.status_code == 200
+        logs = r.json()
+        assert isinstance(logs, list)
+        assert len(logs) >= 2
+
+    def test_ut18_negative_weight_rejected(self):
+        """UT-18: отрицательный вес — HTTP 422 Unprocessable Entity."""
+        r = client.post(f"/api/v1/pets/{self.pet_id}/weight",
+                        json={"weight_kg": -5.0},
+                        headers=self.headers)
+        assert r.status_code == 422
+
+    def test_ut18b_zero_weight_rejected(self):
+        """UT-18b: вес = 0 — HTTP 422 Unprocessable Entity."""
+        r = client.post(f"/api/v1/pets/{self.pet_id}/weight",
+                        json={"weight_kg": 0},
+                        headers=self.headers)
+        assert r.status_code == 422
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UT-19  Soft-delete питомца
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestSoftDelete:
+    """Юнит-тесты мягкого удаления питомца."""
+
+    @classmethod
+    def setup_class(cls):
+        email = f"ut_del_{TS}@pawcare.test"
+        reg = client.post("/api/v1/auth/register",
+                          json={"name": "DelOwner", "email": email, "password": "Pass123!"})
+        cls.token = reg.json()["access_token"]
+        cls.headers = {"Authorization": f"Bearer {cls.token}"}
+
+    def test_ut19_deleted_pet_not_in_list(self):
+        """UT-19: удалённый питомец не появляется в GET /pets."""
+        r_create = client.post("/api/v1/pets",
+                               json={"name": "УдалитьМеня"},
+                               headers=self.headers)
+        assert r_create.status_code == 200
+        pet_id = r_create.json()["id"]
+
+        r_del = client.delete(f"/api/v1/pets/{pet_id}", headers=self.headers)
+        assert r_del.status_code == 200
+
+        r_list = client.get("/api/v1/pets", headers=self.headers)
+        ids = [p["id"] for p in r_list.json()]
+        assert pet_id not in ids
+
+    def test_ut19b_cascade_health_inaccessible(self):
+        """UT-19b: после удаления питомца его медзаписи недоступны (404)."""
+        r_pet = client.post("/api/v1/pets", json={"name": "КаскадПёс"}, headers=self.headers)
+        pet_id = r_pet.json()["id"]
+
+        client.post(f"/api/v1/pets/{pet_id}/health",
+                    json={"record_type": "vaccination",
+                          "title": "Тест",
+                          "record_date": "2024-01-01"},
+                    headers=self.headers)
+
+        client.delete(f"/api/v1/pets/{pet_id}", headers=self.headers)
+
+        r_health = client.get(f"/api/v1/pets/{pet_id}/health", headers=self.headers)
+        assert r_health.status_code in (403, 404)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UT-20  Журнал течки
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestHeatCycleEndpoints:
+    """Юнит-тесты /api/v1/pets/{pet_id}/heat-cycles."""
+
+    @classmethod
+    def setup_class(cls):
+        email = f"ut_heat_{TS}@pawcare.test"
+        reg = client.post("/api/v1/auth/register",
+                          json={"name": "HeatOwner", "email": email, "password": "Pass123!"})
+        cls.token = reg.json()["access_token"]
+        cls.headers = {"Authorization": f"Bearer {cls.token}"}
+        r_pet = client.post("/api/v1/pets",
+                            json={"name": "СучкаТест", "sex": "female"},
+                            headers=cls.headers)
+        cls.pet_id = r_pet.json()["id"]
+
+    def test_ut20_add_heat_cycle(self):
+        """UT-20: добавление цикла течки — HTTP 200, started_at сохранён."""
+        r = client.post(f"/api/v1/pets/{self.pet_id}/heat-cycles",
+                        json={"started_at": "2024-03-01", "notes": "Первая течка"},
+                        headers=self.headers)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["started_at"] == "2024-03-01"
+        assert "id" in body
+
+    def test_ut20b_get_heat_cycles(self):
+        """UT-20b: GET циклов течки — HTTP 200, список."""
+        r = client.get(f"/api/v1/pets/{self.pet_id}/heat-cycles", headers=self.headers)
+        assert r.status_code == 200
+        assert isinstance(r.json(), list)
+        assert len(r.json()) >= 1
+
+    def test_ut20c_update_heat_cycle(self):
+        """UT-20c: обновление цикла — добавление ended_at — HTTP 200."""
+        r_add = client.post(f"/api/v1/pets/{self.pet_id}/heat-cycles",
+                            json={"started_at": "2024-06-01"},
+                            headers=self.headers)
+        cycle_id = r_add.json()["id"]
+
+        r_upd = client.put(f"/api/v1/pets/{self.pet_id}/heat-cycles/{cycle_id}",
+                           json={"ended_at": "2024-06-10"},
+                           headers=self.headers)
+        assert r_upd.status_code == 200
+        assert r_upd.json()["ended_at"] == "2024-06-10"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UT-21  Граничные значения и валидация
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestValidation:
+    """Граничные значения входных данных."""
+
+    @classmethod
+    def setup_class(cls):
+        email = f"ut_val_{TS}@pawcare.test"
+        reg = client.post("/api/v1/auth/register",
+                          json={"name": "ValOwner", "email": email, "password": "Pass123!"})
+        cls.token = reg.json()["access_token"]
+        cls.headers = {"Authorization": f"Bearer {cls.token}"}
+
+    def test_ut21_register_invalid_email(self):
+        """UT-21: регистрация с невалидным email — HTTP 422."""
+        r = client.post("/api/v1/auth/register",
+                        json={"name": "Тест", "email": "not-an-email", "password": "Pass123!"})
+        assert r.status_code == 422
+
+    def test_ut21b_register_empty_password(self):
+        """UT-21b: регистрация с пустым паролем — HTTP 422."""
+        r = client.post("/api/v1/auth/register",
+                        json={"name": "Тест", "email": f"ut21b_{TS}@pawcare.test", "password": ""})
+        assert r.status_code == 422
+
+    def test_ut21c_xss_in_pet_name(self):
+        """UT-21c: XSS в имени питомца сохраняется как строка, не исполняется."""
+        xss = "<script>alert(1)</script>"
+        r = client.post("/api/v1/pets",
+                        json={"name": xss},
+                        headers=self.headers)
+        if r.status_code == 200:
+            assert r.json()["name"] == xss
+        else:
+            assert r.status_code == 422
+
+    def test_ut21d_sql_injection_in_email(self):
+        """UT-21d: SQL-инъекция в email при логине — не вызывает 500."""
+        r = client.post("/api/v1/auth/login",
+                        json={"email": "' OR '1'='1", "password": "anything"})
+        assert r.status_code != 500
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UT-22  Просроченный JWT-токен
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestExpiredToken:
+    """Проверка поведения при истёкшем JWT-токене."""
+
+    def test_ut22_expired_token_rejected(self):
+        """UT-22: запрос с просроченным токеном — HTTP 401/403."""
+        from datetime import timedelta as td
+        expired_token = jwt.encode(
+            {"sub": "fake-user-id",
+             "exp": datetime.now(timezone.utc) - td(days=1)},
+            SECRET_KEY,
+            algorithm=ALGORITHM,
+        )
+        r = client.get("/api/v1/pets",
+                       headers={"Authorization": f"Bearer {expired_token}"})
+        assert r.status_code in (401, 403)
+
+    def test_ut22b_tampered_token_rejected(self):
+        """UT-22b: подменённая подпись токена — HTTP 401/403."""
+        r = client.get("/api/v1/pets",
+                       headers={"Authorization": "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJoYWNrZXIifQ.INVALIDSIG"})
+        assert r.status_code in (401, 403)
