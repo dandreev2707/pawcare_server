@@ -608,9 +608,9 @@ async def upload_pet_photo(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-        pet = db.query(Pet).filter(Pet.id == pet_id, Pet.owner_id == current_user.id).first()
-        if not pet:
-            raise HTTPException(status_code=404, detail="Питомец не найден")
+    pet = db.query(Pet).filter(Pet.id == pet_id, Pet.owner_id == current_user.id).first()
+    if not pet:
+        raise HTTPException(status_code=404, detail="Питомец не найден")
     contents = await file.read()
 
     if CLOUDINARY_CLOUD_NAME:
