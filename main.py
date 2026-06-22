@@ -727,8 +727,9 @@ def _build_health_pdf(pet, records) -> bytes:
     pdf = FPDF()
     pdf.add_page()
 
-    font_path = os.path.join(os.path.dirname(__file__), "DejaVuSans.ttf")
-    bold_path = os.path.join(os.path.dirname(__file__), "DejaVuSans-Bold.ttf")
+    _dir = os.path.dirname(os.path.abspath(__file__))
+    font_path = os.path.join(_dir, "DejaVuSans.ttf")
+    bold_path = os.path.join(_dir, "DejaVuSans-Bold.ttf")
     if os.path.exists(font_path):
         pdf.add_font("DejaVu", "", font_path)
         pdf.add_font("DejaVu", "B", bold_path if os.path.exists(bold_path) else font_path)
@@ -768,7 +769,8 @@ def _build_health_pdf(pet, records) -> bytes:
             label = type_labels.get(r.record_type, r.record_type)
             pdf.set_fill_color(232, 245, 238)
             pdf.set_font(base_font, "B", 12)
-            pdf.cell(0, 8, f"{r.title}  [{label}]", fill=True,
+            title_safe = (r.title or "").replace('\n', ' ').replace('\r', '')
+            pdf.cell(0, 8, f"{title_safe}  [{label}]", fill=True,
                      new_x=XPos.LMARGIN, new_y=YPos.NEXT)
             pdf.set_font(base_font, "", 10)
             pdf.set_text_color(80, 80, 80)

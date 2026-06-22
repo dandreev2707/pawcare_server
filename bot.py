@@ -400,7 +400,7 @@ async def _send_health_pdf(query, chat_id: str, pet_id: str):
         await query.message.reply_text("❌ Питомец не найден.")
         return
     if response.status_code != 200:
-        await query.message.reply_text("❌ Не удалось создать PDF.")
+        await query.message.reply_text(f"❌ Не удалось создать PDF. Код: {response.status_code}\n{response.text[:200]}")
         return
 
     cd = response.headers.get("content-disposition", "")
