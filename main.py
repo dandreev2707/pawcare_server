@@ -14,6 +14,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import atexit
 import uuid
 import os
+import urllib.parse
 import random
 import string
 import shutil
@@ -806,11 +807,12 @@ def export_health_pdf(pet_id: str,
         pdf_bytes = _build_health_pdf(pet, records)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка генерации PDF: {str(e)}")
-    filename = f"health_{pet.name}_{date.today()}.pdf"
+    safe_name = f"health_{date.today()}.pdf"
+    encoded_name = urllib.parse.quote(f"health_{pet.name}_{date.today()}.pdf")
     return StreamingResponse(
         io.BytesIO(pdf_bytes),
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": f"attachment; filename=\"{safe_name}\"; filename*=UTF-8''{encoded_name}"},
     )
 
 # WEIGHT
@@ -1587,11 +1589,12 @@ def telegram_get_pdf(chat_id: str, pet_id: str, db: Session = Depends(get_db)):
         pdf_bytes = _build_health_pdf(pet, records)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка генерации PDF: {str(e)}")
-    filename = f"health_{pet.name}_{date.today()}.pdf"
+    safe_name = f"health_{date.today()}.pdf"
+    encoded_name = urllib.parse.quote(f"health_{pet.name}_{date.today()}.pdf")
     return StreamingResponse(
         io.BytesIO(pdf_bytes),
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": f"attachment; filename=\"{safe_name}\"; filename*=UTF-8''{encoded_name}"},
     )
 
 
